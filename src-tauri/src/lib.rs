@@ -384,7 +384,7 @@ async fn check_update() -> Result<UpdateInfo, String> {
                 .user_agent("MAS-Activator")
                 .build(),
         )
-        .get("https://api.github.com/repos/SMSMy/masR/releases/latest")
+        .get("https://api.github.com/repos/SMSMy/mas-activator-Disktop/releases/latest")
         .header("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| format!("تعذر الاتصال بـ GitHub: {}", e))?;
