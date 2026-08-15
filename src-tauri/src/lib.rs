@@ -331,6 +331,7 @@ enum OutcomeKind {
     TimedOut,
     NoConnection,
     BlockedByProtection,
+    PinRefreshRequired,
     Failed,
 }
 
@@ -343,6 +344,8 @@ struct OperationOutcome {
     after: Option<String>,
     checked_at: Option<String>,
     output_tail: Option<String>,
+    pin_from: Option<String>,
+    pin_to: Option<String>,
 }
 
 fn outcome(kind: OutcomeKind, label: &str, message: String) -> OperationOutcome {
@@ -354,6 +357,8 @@ fn outcome(kind: OutcomeKind, label: &str, message: String) -> OperationOutcome 
         after: None,
         checked_at: None,
         output_tail: None,
+        pin_from: None,
+        pin_to: None,
     }
 }
 
@@ -381,6 +386,7 @@ fn mas_download_url() -> String {
 }
 
 const MAS_EXPECTED_SHA256: &str = "850F979665FB93999ACAE93F4790C1FF8ED2041532060B7966A121C2D29A0BFA";
+const MAS_PINNED_TAG: &str = "3.12";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -405,50 +411,192 @@ fn hash_matches_expected(bytes: &[u8]) -> bool {
     sha256_hex(bytes).eq_ignore_ascii_case(MAS_EXPECTED_SHA256)
 }
 
-enum ScriptError {
-    NoConnection(String),
-    Integrity(String),
-    Io(String),
+// ===== دبوس يتجدد ذاتيًا بموافقة المستخدم (عمر طويل دون تحديث التطبيق) =====
+
+fn parse_tag(t: &str) -> Vec<u32> {
+    t.trim_start_matches('v')
+        .split('.')
+        .filter_map(|p| p.parse::<u32>().ok())
+        .collect()
 }
 
-/// يُرجِع مسار سكربت MAS الجاهز للتشغيل + هل أتى من الكاش.
-/// السياسة: أي محتوى غير مطابق للبصمة المثبتة = منع التشغيل.
-async fn ensure_mas_script() -> Result<(PathBuf, bool), ScriptError> {
-    let cache_path = resolve_cache_path().map_err(ScriptError::Io)?;
-
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        if hash_matches_expected(&bytes) {
-            return Ok((cache_path, true));
+fn tag_is_newer(a: &str, b: &str) -> bool {
+    let va = parse_tag(a);
+    let vb = parse_tag(b);
+    let n = va.len().max(vb.len());
+    for i in 0..n {
+        let x = va.get(i).copied().unwrap_or(0);
+        let y = vb.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
         }
     }
+    false
+}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PinMeta {
+    version_tag: String,
+    sha256: String,
+    adopted_at: u64,
+}
+
+fn pin_meta_path() -> Result<PathBuf, String> {
+    Ok(resolve_cache_dir()?.join("pin-meta.json"))
+}
+
+fn load_pin_meta() -> Option<PinMeta> {
+    let path = pin_meta_path().ok()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_pin_meta(meta: &PinMeta) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
+    std::fs::write(pin_meta_path()?, raw).map_err(|e| e.to_string())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn download_mas_script() -> Result<Vec<u8>, String> {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .user_agent("MAS-Activator")
             .timeout_global(Some(DOWNLOAD_TIMEOUT))
             .build(),
     );
-
     let response = agent
         .get(mas_download_url())
         .call()
-        .map_err(|e| ScriptError::NoConnection(format!("تعذر تنزيل سكربت التفعيل: {}", e)))?;
-
-    let bytes = response
+        .map_err(|e| format!("تعذر تنزيل سكربت التفعيل: {}", e))?;
+    response
         .into_body()
         .read_to_vec()
-        .map_err(|e| ScriptError::NoConnection(format!("خطأ أثناء تنزيل السكربت: {}", e)))?;
+        .map_err(|e| format!("خطأ أثناء تنزيل السكربت: {}", e))
+}
 
-    if !hash_matches_expected(&bytes) {
-        return Err(ScriptError::Integrity(
-            "التحقق من سلامة سكربت التفعيل فشل — النسخة المحملة لا تطابق الإصدار المعتمد. لم يُنفذ أي شيء.".to_string(),
-        ));
+async fn fetch_mas_latest_tag() -> Result<String, String> {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .user_agent("MAS-Activator")
+            .timeout_global(Some(Duration::from_secs(60)))
+            .build(),
+    );
+    let response = agent
+        .get("https://api.github.com/repos/massgravel/Microsoft-Activation-Scripts/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("تعذر الاستعلام عن إصدار سكربت التفعيل: {}", e))?;
+    let json: serde_json::Value = response
+        .into_body()
+        .read_json()
+        .map_err(|e| format!("تعذر قراءة بيانات الإصدار: {}", e))?;
+    json.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_start_matches('v').to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "بيانات الإصدار غير متوقعة".to_string())
+}
+
+enum ScriptResolution {
+    Ready(PathBuf, bool),
+    NeedsAdoption { from_tag: String, to_tag: String },
+    NoConnection(String),
+    Integrity(String),
+    Io(String),
+}
+
+/// إرجاع مسار سكربت MAS الجاهز للتشغيل + هل أتى من الكاش.
+/// السياسة: الكاش المطابق للبصمة المعتمدة (المضمنة أو المتبناة) = تشغيل.
+/// محتوى غير مطابق + إصدار رسمي أحدث = اعتماد بموافقة المستخدم.
+async fn ensure_mas_script() -> ScriptResolution {
+    let cache_path = match resolve_cache_path() {
+        Ok(p) => p,
+        Err(e) => return ScriptResolution::Io(e),
+    };
+
+    let cache_bytes = std::fs::read(&cache_path).ok();
+    let meta = load_pin_meta();
+
+    let embedded_match = cache_bytes
+        .as_deref()
+        .map(hash_matches_expected)
+        .unwrap_or(false);
+    let recorded_match = match (&cache_bytes, &meta) {
+        (Some(b), Some(m)) => sha256_hex(b).eq_ignore_ascii_case(&m.sha256),
+        _ => false,
+    };
+
+    if embedded_match || recorded_match {
+        return ScriptResolution::Ready(cache_path, true);
     }
 
-    std::fs::write(&cache_path, &bytes)
-        .map_err(|e| ScriptError::Io(format!("تعذر حفظ السكربت محليًا: {}", e)))?;
-    Ok((cache_path, false))
+    // محاولة تنزيل طازج
+    let downloaded = download_mas_script().await;
+    if let Ok(bytes) = &downloaded {
+        if hash_matches_expected(bytes) {
+            let _ = std::fs::write(&cache_path, bytes);
+            return ScriptResolution::Ready(cache_path, false);
+        }
+    }
+
+    // عدم تطابق: نحدد الإصدار الرسمي الأحدث
+    match fetch_mas_latest_tag().await {
+        Ok(latest) if tag_is_newer(&latest, MAS_PINNED_TAG) => ScriptResolution::NeedsAdoption {
+            from_tag: MAS_PINNED_TAG.to_string(),
+            to_tag: latest,
+        },
+        Ok(latest) => ScriptResolution::Integrity(format!(
+            "التحقق من سلامة سكربت التفعيل فشل (الإصدار الرسمي {} ليس أحدث من المعتمد) — لم يُنفذ أي شيء.",
+            latest
+        )),
+        Err(tag_err) => {
+            if downloaded.is_err() {
+                match cache_bytes {
+                    Some(_) => ScriptResolution::Integrity(
+                        "النسخة المخزنة محليًا لا تجتاز التحقق — لم يُنفذ أي شيء.".to_string(),
+                    ),
+                    None => ScriptResolution::NoConnection(format!(
+                        "{} — لا توجد نسخة محلية صالحة.",
+                        tag_err
+                    )),
+                }
+            } else {
+                ScriptResolution::Integrity(format!(
+                    "تعذر تحديد الإصدار الرسمي لسكربت التفعيل ({}) — لم يُنفذ أي شيء.",
+                    tag_err
+                ))
+            }
+        }
+    }
 }
+
+#[tauri::command]
+async fn adopt_mas_pin() -> Result<String, String> {
+    let bytes = download_mas_script().await?;
+    let latest_tag = fetch_mas_latest_tag().await?;
+    if !tag_is_newer(&latest_tag, MAS_PINNED_TAG) {
+        return Err("الإصدار الرسمي ليس أحدث من المعتمد — لم يُعتمد أي شيء".to_string());
+    }
+    let cache_path = resolve_cache_path()?;
+    std::fs::write(&cache_path, &bytes).map_err(|e| format!("تعذر حفظ السكربت: {}", e))?;
+    let meta = PinMeta {
+        version_tag: latest_tag.clone(),
+        sha256: sha256_hex(&bytes),
+        adopted_at: now_unix(),
+    };
+    save_pin_meta(&meta)?;
+    Ok(format!(
+        "اعتُمد الإصدار {} من سكربت التفعيل (بصمة {}...)",
+        latest_tag,
+        &meta.sha256[..8]
+    ))
+ }
 
 // ===== أدوات PowerShell =====
 
@@ -705,10 +853,28 @@ async fn run_activation(
 
     let _ = push_log(&state, &format!("[INFO] جاري تنفيذ: {} ...", label));
 
-    // 4.1: مصدر مثبت + تحقق سلامة + كاش محلي — أي محتوى غير مطابق = منع التشغيل
+    // 4.1: مصدر مثبت + تحقق سلامة + كاش محلي + دبوس يتجدد بموافقة المستخدم
     let (mas_path, from_cache) = match ensure_mas_script().await {
-        Ok(v) => v,
-        Err(ScriptError::NoConnection(msg)) => {
+        ScriptResolution::Ready(path, cached) => (path, cached),
+        ScriptResolution::NeedsAdoption { from_tag, to_tag } => {
+            let _ = push_log(
+                &state,
+                &format!(
+                    "[INFO] إصدار جديد من سكربت التفعيل متاح ({from_tag} -> {to_tag}) — يلزم اعتماد المستخدم"
+                ),
+            );
+            let mut res = outcome(
+                OutcomeKind::PinRefreshRequired,
+                "اعتماد الإصدار الجديد مطلوب 🔑",
+                format!(
+                    "صدر إصدار جديد ({from_tag} → {to_tag}) من سكربت التفعيل. اعتمده بموافقتك للمتابعة."
+                ),
+            );
+            res.pin_from = Some(from_tag);
+            res.pin_to = Some(to_tag);
+            return Ok(res);
+        }
+        ScriptResolution::NoConnection(msg) => {
             let _ = push_log(&state, &format!("[ERROR] {}", msg));
             return Ok(outcome(
                 OutcomeKind::NoConnection,
@@ -716,11 +882,11 @@ async fn run_activation(
                 "تعذر تنزيل سكربت التفعيل — تحقق من اتصالك بالإنترنت.".to_string(),
             ));
         }
-        Err(ScriptError::Integrity(msg)) => {
+        ScriptResolution::Integrity(msg) => {
             let _ = push_log(&state, &format!("[ERROR] {}", msg));
             return Ok(outcome(OutcomeKind::Failed, "تحقق السلامة ❌", msg));
         }
-        Err(ScriptError::Io(msg)) => {
+        ScriptResolution::Io(msg) => {
             let _ = push_log(&state, &format!("[ERROR] {}", msg));
             return Ok(outcome(
                 OutcomeKind::Failed,
@@ -1987,7 +2153,8 @@ pub fn run() {
             change_edition,
             check_admin,
             export_logs,
-            open_windows_security
+            open_windows_security,
+            adopt_mas_pin
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2400,6 +2567,30 @@ The operation completed successfully.
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tag_comparison_is_numeric_not_lexicographic() {
+        assert!(tag_is_newer("3.12", "3.9"));
+        assert!(tag_is_newer("3.12.1", "3.12"));
+        assert!(tag_is_newer("4.0", "3.12"));
+        assert!(!tag_is_newer("3.12", "3.12"));
+        assert!(!tag_is_newer("3.9", "3.12"));
+        assert!(tag_is_newer("v3.13", "3.12"));
+    }
+
+    #[test]
+    fn adopted_meta_roundtrip() {
+        let meta = PinMeta {
+            version_tag: "3.13".to_string(),
+            sha256: "ABC".to_string(),
+            adopted_at: 123,
+        };
+        let raw = serde_json::to_string(&meta).unwrap();
+        let back: PinMeta = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.version_tag, "3.13");
+        assert_eq!(back.sha256, "ABC");
+        assert_eq!(back.adopted_at, 123);
     }
 
     #[test]

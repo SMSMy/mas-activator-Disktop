@@ -40,6 +40,8 @@ export default function Home() {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<{ action: ActivationAction; buttonKey: string } | null>(null);
   const [protectionBlocked, setProtectionBlocked] = useState(false);
+  const [pinAdoption, setPinAdoption] = useState<{ from: string; to: string } | null>(null);
+  const [adopting, setAdopting] = useState(false);
   const buttonRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   useEffect(() => {
@@ -117,6 +119,13 @@ export default function Home() {
           toast.error(outcome.message);
           setProtectionBlocked(true);
           break;
+        case "pin_refresh_required":
+          toast.warning(outcome.message);
+          setPinAdoption({
+            from: outcome.pin_from || "؟",
+            to: outcome.pin_to || "؟",
+          });
+          break;
         default:
           toast.error(outcome.message);
           break;
@@ -176,6 +185,23 @@ export default function Home() {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       toast.error(msg);
+    }
+  };
+
+  const handleAdoptPin = async () => {
+    if (!pinAdoption) return;
+    setAdopting(true);
+    try {
+      const message = await invoke<string>("adopt_mas_pin");
+      addLog(`🔒 ${message}`);
+      toast.success(message);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      addLog(`❌ ${msg}`);
+      toast.error(msg);
+    } finally {
+      setAdopting(false);
+      setPinAdoption(null);
     }
   };
 
@@ -606,6 +632,22 @@ export default function Home() {
         confirmLabel="متابعة التنفيذ"
         loading={busy}
         onConfirm={confirmAndRun}
+        isDark={isDark}
+      />
+
+      {/* Pin adoption dialog (4.1 self-healing) */}
+      <ConfirmDialog
+        open={pinAdoption !== null}
+        onOpenChange={(v) => !adopting && setPinAdoption(v ? pinAdoption : null)}
+        title="اعتماد إصدار جديد من سكربت التفعيل"
+        description={
+          pinAdoption
+            ? `صدر إصدار جديد من سكربت التفعيل الرسمي (${pinAdoption.from} → ${pinAdoption.to}). سيتم تنزيله من المصدر الرسمي وحساب بصمته وتسجيلها محليًا مع وقت الاعتماد. الاعتماد قرارك — بلا موافقة لن يُنفذ أي محتوى جديد.`
+            : ""
+        }
+        confirmLabel="اعتماد الإصدار الجديد"
+        loading={adopting}
+        onConfirm={handleAdoptPin}
         isDark={isDark}
       />
 

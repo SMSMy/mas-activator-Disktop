@@ -33,6 +33,7 @@ export type OutcomeKind =
   | "timed_out"
   | "no_connection"
   | "blocked_by_protection"
+  | "pin_refresh_required"
   | "failed";
 
 export interface OperationOutcome {
@@ -43,6 +44,8 @@ export interface OperationOutcome {
   after: string | null;
   checked_at: string | null;
   output_tail: string | null;
+  pin_from: string | null;
+  pin_to: string | null;
 }
 
 export type OpState = "idle" | "running" | "cancelling";
