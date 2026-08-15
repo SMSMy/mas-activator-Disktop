@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  frontend:
+    name: Frontend (TypeScript + Build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.4.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm build
+
+  rust:
+    name: Rust (test + clippy)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.4.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+        name: Build frontend (مطلوب لـ generate_context)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # ملاحظة: manifest بـ requireAdministrator يمنع تنفيذ اختبارات الـ bin (خطأ 740)
+      - run: cargo test --lib
+        working-directory: src-tauri
+      - run: cargo clippy --lib -- -D warnings
+        working-directory: src-tauri
+
+  guard:
+    name: Guard (no build artifacts / no secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: منع ملفات البناء والتنفيذ من المستودع
+        run: |
+          set -e
+          if git ls-files | grep -E '\.(exe|msi|zip|7z)$|^dist/|^node_modules/|^src-tauri/target/|^\.manus-logs/|^\.webdev/' ; then
+            echo "ERROR: build artifacts found in repository"
+            exit 1
+          fi
+      - name: منع أنماط الأسرار الظاهرة
+        run: |
+          set -e
+          if grep -rEI '(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----)' --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=target . ; then
+            echo "ERROR: potential secrets found"
+            exit 1
+          fi
+
+  release:
+    name: Release build (Windows)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.4.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cargo test --lib
+        working-directory: src-tauri
+      - run: pnpm tauri build
+      # النسخة المحمولة: الـ exe الخام — الاستخدام المتوقع لمرة واحدة
+      - name: Produce portable exe
+        shell: pwsh
+        run: |
+          $v = (Get-Content package.json | ConvertFrom-Json).version
+          $dst = "MAS.Activator_$v.Portable.exe"
+          Copy-Item "src-tauri/target/release/app.exe" $dst
+          $h = (Get-FileHash $dst -Algorithm SHA256).Hash
+          "PORTABLE_SHA256=$h" >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mas-activator-portable
+          path: MAS.Activator_*.Portable.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mas-activator-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe

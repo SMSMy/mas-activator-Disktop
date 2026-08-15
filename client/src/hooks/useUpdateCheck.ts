@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
 
 export interface UpdateInfo {
   available: boolean;
@@ -8,6 +9,7 @@ export interface UpdateInfo {
   notes: string;
   download_url: string;
   asset_url: string;
+  check_error: string | null;
 }
 
 export function useUpdateCheck() {
@@ -21,9 +23,11 @@ export function useUpdateCheck() {
         if (info.available) {
           setUpdateInfo(info);
           setShowDialog(true);
+        } else if (info.check_error) {
+          toast.warning(info.check_error);
         }
       } catch {
-        // Silent fail - no network or no releases yet
+        toast.warning("تعذر التحقق من التحديثات");
       }
     };
     check();

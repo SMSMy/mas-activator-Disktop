@@ -1,19 +1,30 @@
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { Loader2, Zap, Monitor, FileText, CheckCircle2, Sun, Moon, PartyPopper } from "lucide-react";
+import { Loader2, Zap, Monitor, FileText, CheckCircle2, Sun, Moon, PartyPopper, Ban, ArrowLeftRight, ShieldAlert, FileDown } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { TargetAndTransition } from "framer-motion";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { toast } from "sonner";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { useTheme } from "@/contexts/ThemeContext";
 import { Confetti } from "@/components/ui/Confetti";
 import { LogViewer } from "@/components/ui/LogViewer";
 import { StatusDialog } from "@/components/ui/StatusDialog";
+import { EditionDialog } from "@/components/EditionDialog";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import type { OperationOutcome, OpState, StatusReport } from "@/types";
+
+type ActivationAction = {
+  label: string;
+  sub: string;
+  kind: string;
+  name: string;
+};
 
 export default function Home() {
   const { theme, toggleTheme } = useTheme();
-  const [isLoading, setIsLoading] = useState(false);
+  const [opState, setOpState] = useState<OpState>("idle");
   const [activeAction, setActiveAction] = useState<string | null>(null);
   const [statusDialog, setStatusDialog] = useState(false);
   const [status, setStatus] = useState({ windows: "جار الفحص...", office: "جار الفحص..." });
@@ -23,7 +34,22 @@ export default function Home() {
   const [showLogs, setShowLogs] = useState(false);
   const [celebratingKey, setCelebratingKey] = useState<string | null>(null);
   const [confettiOrigin, setConfettiOrigin] = useState<{ x: number; y: number } | null>(null);
+  const [editionDialog, setEditionDialog] = useState(false);
+  const [version, setVersion] = useState("");
+  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [pendingAction, setPendingAction] = useState<{ action: ActivationAction; buttonKey: string } | null>(null);
+  const [protectionBlocked, setProtectionBlocked] = useState(false);
   const buttonRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => setVersion(""));
+    invoke<boolean>("check_admin")
+      .then(setIsAdmin)
+      .catch(() => setIsAdmin(null));
+  }, []);
 
   const addLog = (message: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${message}`]);
@@ -46,28 +72,115 @@ export default function Home() {
     setTimeout(() => setCelebratingKey(null), 2500);
   }, []);
 
-  const handleActivation = async (action: string, command: string, buttonKey: string) => {
-    setIsLoading(true);
-    setActiveAction(action);
+  const busy = opState === "running" || opState === "cancelling";
+
+  const handleActivation = async (action: ActivationAction, buttonKey: string) => {
+    if (busy) return;
+    setOpState("running");
+    setActiveAction(action.name);
     setLogs([]);
-    addLog(`جاري تنفيذ: ${action}`);
+    setProtectionBlocked(false);
+    addLog(`جاري تنفيذ: ${action.label}`);
 
     try {
-      const result = await invoke<string>(command);
-      addLog(`✅ ${result}`);
-      toast.success(`تم ${action} بنجاح!`);
-      triggerCelebration(buttonKey);
+      const outcome = await invoke<OperationOutcome>("run_activation", { kind: action.kind });
+      addLog(`[${outcome.label}] ${outcome.message}`);
+      if (outcome.checked_at) {
+        addLog(`🕐 وقت الفحص: ${outcome.checked_at}`);
+      }
+      if (outcome.output_tail) {
+        addLog(outcome.output_tail.slice(-500));
+      }
+
+      switch (outcome.kind) {
+        case "verified_change":
+          toast.success(outcome.message);
+          triggerCelebration(buttonKey);
+          await handleCheckStatus();
+          break;
+        case "no_change":
+          toast.info(outcome.message);
+          break;
+        case "unverified":
+          toast.warning(outcome.message);
+          break;
+        case "cancelled":
+          toast.info("تم إلغاء العملية");
+          break;
+        case "timed_out":
+          toast.error("انتهت مهلة العملية وأُنهيت");
+          break;
+        case "no_connection":
+          toast.error("لا يوجد اتصال بالإنترنت");
+          break;
+        case "blocked_by_protection":
+          toast.error(outcome.message);
+          setProtectionBlocked(true);
+          break;
+        default:
+          toast.error(outcome.message);
+          break;
+      }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       addLog(`❌ ${errorMsg}`);
       toast.error(`حدث خطأ: ${errorMsg}`);
     } finally {
-      setIsLoading(false);
+      setOpState("idle");
       setActiveAction(null);
     }
   };
 
+  const handleCancel = async () => {
+    if (opState !== "running") return;
+    setOpState("cancelling");
+    addLog("⏹️ جاري إلغاء العملية...");
+    try {
+      await invoke("cancel_operation");
+    } catch {
+      // العملية ربما انتهت بالفعل
+    }
+  };
+
+  const requestActivation = (action: ActivationAction, buttonKey: string) => {
+    if (busy) return;
+    setPendingAction({ action, buttonKey });
+    setConfirmOpen(true);
+  };
+
+  const confirmAndRun = async () => {
+    if (!pendingAction) return;
+    const { action, buttonKey } = pendingAction;
+    setConfirmOpen(false);
+    setPendingAction(null);
+    await handleActivation(action, buttonKey);
+  };
+
+  const handleExportReport = async () => {
+    try {
+      const path = await invoke<string>("export_logs");
+      addLog(`📄 حُفظ التقرير التشخيصي في: ${path}`);
+      toast.success("حُفظ التقرير التشخيصي في مجلد التنزيلات");
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      addLog(`❌ ${msg}`);
+      toast.error(`تعذر حفظ التقرير: ${msg}`);
+    }
+  };
+
+  const handleOpenWindowsSecurity = async () => {
+    try {
+      const message = await invoke<string>("open_windows_security");
+      addLog(`🛡️ ${message}`);
+      toast.info(message);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      toast.error(msg);
+    }
+  };
+
   const handleCheckStatus = async () => {
+    if (busy) return;
     setStatusDialog(true);
     setStatusLoading(true);
     setStatusResult("none");
@@ -76,30 +189,26 @@ export default function Home() {
     addLog("🔍 جاري فحص حالة التفعيل...");
 
     try {
-      const result = await invoke<string>("check_status");
+      const report = await invoke<StatusReport>("check_status");
 
-      try {
-        const parsed = JSON.parse(result);
-        const winStatus = parsed.windows || "غير معروف";
-        const officeStatus = parsed.office || "غير معروف";
-        const officeName = parsed.office_name || "";
+      const winStatus = report.windows ? report.windows.label : "غير مثبت";
+      const officeStatus = report.office
+        ? `${report.office.label}${report.office.name ? ` (${report.office.name})` : ""}`
+        : "غير مثبت";
 
-        setStatus({
-          windows: winStatus,
-          office: officeStatus,
-        });
+      setStatus({ windows: winStatus, office: officeStatus });
 
-        addLog(`✅ اكتمل الفحص بنجاح`);
-        addLog(`💻 ويندوز: ${winStatus}`);
-        addLog(`📄 أوفيس: ${officeStatus}${officeName ? ` (${officeName})` : ""}`);
-
-        if (parsed.error) {
-          addLog(`⚠️ ملاحظة: ${parsed.error}`);
-        }
-      } catch {
-        setStatus({ windows: result, office: "غير معروف" });
-        addLog(`⚠️ تم الفحص لكن النتيجة غير مُنسقة`);
+      addLog(`✅ اكتمل الفحص${report.checked_at ? ` — ${report.checked_at}` : ""}`);
+      addLog(`💻 ويندوز: ${report.windows ? `${report.windows.name} — ${report.windows.label} (${report.windows.selection_reason})` : "غير مثبت"}`);
+      addLog(`📄 أوفيس: ${report.office ? `${report.office.name} — ${report.office.label} (${report.office.selection_reason})` : "غير مثبت"}`);
+      for (const p of report.observed.slice(0, 5)) {
+        addLog(`   • ${p.name} — ${p.label}`);
       }
+
+      if (report.error) {
+        addLog(`⚠️ ملاحظة: ${report.error.message}`);
+      }
+
       setStatusResult("success");
       triggerCelebration("status");
     } catch (error) {
@@ -128,7 +237,6 @@ export default function Home() {
     visible: { opacity: 1, y: 0 },
   };
 
-  // إصلاح خطأ TS2322: تحديد النوع صراحة باستخدام satisfies
   const cardHover = {
     scale: 1.03,
     y: -4,
@@ -152,6 +260,12 @@ export default function Home() {
       : "bg-[#0F172A] hover:bg-[#1e293b]",
   };
 
+  const mainActions: Array<{ key: "windows" | "office" | "all"; action: ActivationAction; icon: typeof Monitor }> = [
+    { key: "windows", action: { label: "تفعيل ويندوز", sub: "HWID Activation", kind: "windows", name: "تفعيل ويندوز" }, icon: Monitor },
+    { key: "office", action: { label: "تفعيل أوفيس", sub: "Ohook Activation", kind: "office", name: "تفعيل أوفيس" }, icon: FileText },
+    { key: "all", action: { label: "تفعيل الكل", sub: "Windows + Office", kind: "all", name: "تفعيل الكل" }, icon: Zap },
+  ];
+
   return (
     <div className="min-h-screen grid-bg-animated relative overflow-hidden" dir="rtl">
       {/* Top bar: theme toggle (left) + credits (right) */}
@@ -168,7 +282,7 @@ export default function Home() {
           )}
         </button>
         <span className={`text-xs tracking-wide ${isDark ? "text-cyan-300/40" : "text-slate-400"}`}>
-          تطوير: يزيد يحيى | الإصدار 2.1
+          تطوير: يزيد يحيى{version ? ` | الإصدار ${version}` : ""}
         </span>
       </div>
 
@@ -182,6 +296,18 @@ export default function Home() {
       >
         {/* Header */}
         <motion.div className="text-center mb-16" variants={itemVariants}>
+          {isAdmin === false && (
+            <div
+              className={`mb-6 px-4 py-3 rounded-lg text-sm flex items-center justify-center gap-2 ${
+                isDark
+                  ? "bg-amber-900/40 border border-amber-500/40 text-amber-200"
+                  : "bg-amber-50 border border-amber-300 text-amber-800"
+              }`}
+            >
+              <ShieldAlert className="w-4 h-4 shrink-0" />
+              التطبيق يعمل بدون صلاحيات المسؤول — عمليات التفعيل والتغيير لن تنجح. أغلق التطبيق وأعد تشغيله «كمسؤول».
+            </div>
+          )}
           <div className="mb-4 inline-flex items-center gap-3">
             <Monitor className={`w-10 h-10 ${isDark ? "text-cyan-400" : "text-[#4682B4]"}`} />
           </div>
@@ -204,16 +330,8 @@ export default function Home() {
 
         {/* Main buttons grid */}
         <motion.div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-12 max-w-2xl w-full" variants={itemVariants}>
-          {(["windows", "office", "all", "status"] as const).map((key) => {
-            const config = {
-              windows: { label: "تفعيل ويندوز", sub: "HWID Activation", icon: Monitor, cmd: "activate_windows", name: "تفعيل ويندوز" },
-              office: { label: "تفعيل أوفيس", sub: "Ohook Activation", icon: FileText, cmd: "activate_office", name: "تفعيل أوفيس" },
-              all: { label: "تفعيل الكل", sub: "Windows + Office", icon: Zap, cmd: "activate_all", name: "تفعيل الكل" },
-              status: { label: "فحص الحالة", sub: "Status Check", icon: CheckCircle2, cmd: "", name: "" },
-            }[key];
-
-            const isThisLoading = isLoading && (key === "status" ? true : activeAction === config.name);
-            const isStatus = key === "status";
+          {mainActions.map(({ key, action, icon: Icon }) => {
+            const isThisLoading = activeAction === action.name && busy;
             const isCelebrating = celebratingKey === key;
 
             return (
@@ -228,13 +346,12 @@ export default function Home() {
                 } : {}}
               >
                 <Button
-                  onClick={() => isStatus ? handleCheckStatus() : handleActivation(config.name, config.cmd, key)}
-                  disabled={isLoading}
+                  onClick={() => requestActivation(action, key)}
+                  disabled={busy}
                   className={`w-full h-32 rounded-xl text-lg font-bold flex flex-col items-center justify-center gap-3 transition-all duration-300 shadow-lg ${cardStyles[key]} text-white relative overflow-hidden ${
                     isCelebrating ? 'ring-4 ring-green-400/70 shadow-[0_0_30px_rgba(74,222,128,0.4)]' : ''
                   }`}
                 >
-                  {/* Success shimmer overlay */}
                   {isCelebrating && (
                     <motion.div
                       className="absolute inset-0 bg-gradient-to-r from-transparent via-white/25 to-transparent"
@@ -270,17 +387,83 @@ export default function Home() {
                         animate={{ opacity: 1, scale: 1 }}
                         exit={{ opacity: 0, scale: 0.5 }}
                       >
-                        <config.icon className="w-8 h-8 text-white" />
+                        <Icon className="w-8 h-8 text-white" />
                       </motion.div>
                     )}
                   </AnimatePresence>
-                  <span className="text-white relative z-10">{isCelebrating ? '✅ تم بنجاح!' : config.label}</span>
-                  <span className="text-xs text-white/60 relative z-10">{config.sub}</span>
+                  <span className="text-white relative z-10">{isCelebrating ? '✅ تم بنجاح!' : action.label}</span>
+                  <span className="text-xs text-white/60 relative z-10">{action.sub}</span>
                 </Button>
               </motion.div>
             );
           })}
+
+          {/* Status card */}
+          <motion.div
+            ref={(el) => { buttonRefs.current["status"] = el; }}
+            whileHover={cardHover}
+            whileTap={cardTap}
+          >
+            <Button
+              onClick={handleCheckStatus}
+              disabled={busy}
+              className={`w-full h-32 rounded-xl text-lg font-bold flex flex-col items-center justify-center gap-3 transition-all duration-300 shadow-lg ${cardStyles.status} text-white relative overflow-hidden`}
+            >
+              {statusLoading ? (
+                <Loader2 className="w-8 h-8 animate-spin text-white" />
+              ) : (
+                <CheckCircle2 className="w-8 h-8 text-white" />
+              )}
+              <span className="text-white relative z-10">فحص الحالة</span>
+              <span className="text-xs text-white/60 relative z-10">Status Check</span>
+            </Button>
+          </motion.div>
         </motion.div>
+
+        {/* Cancel button while running */}
+        {busy && (
+          <motion.div className="mb-8" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+            <Button
+              onClick={handleCancel}
+              disabled={opState === "cancelling"}
+              className="rounded-lg px-6 py-3 font-semibold bg-red-600/80 hover:bg-red-700 text-white border border-red-400/30 disabled:opacity-50"
+            >
+              {opState === "cancelling" ? (
+                <Loader2 className="w-4 h-4 animate-spin ml-2" />
+              ) : (
+                <Ban className="w-4 h-4 ml-2" />
+              )}
+              {opState === "cancelling" ? "جاري الإلغاء..." : "إلغاء العملية"}
+            </Button>
+          </motion.div>
+        )}
+
+        {/* Protection blocked banner (يظهر فقط عند الحجب) */}
+        {protectionBlocked && !busy && (
+          <motion.div
+            className={`mb-8 w-full max-w-2xl rounded-lg p-4 space-y-2 ${
+              isDark
+                ? "bg-amber-900/30 border border-amber-500/40"
+                : "bg-amber-50 border border-amber-300"
+            }`}
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+          >
+            <p className={`text-sm font-semibold flex items-center gap-2 ${isDark ? "text-amber-200" : "text-amber-800"}`}>
+              <ShieldAlert className="w-4 h-4 shrink-0" />
+              تم حظر العملية بواسطة حماية النظام
+            </p>
+            <p className={`text-xs leading-relaxed ${isDark ? "text-amber-100/80" : "text-amber-800"}`}>
+              تذكير: أي تغيير في إعدادات الحماية قرارك — أعد التمكين فور انتهاء العملية.
+            </p>
+            <Button
+              onClick={handleOpenWindowsSecurity}
+              className={`${isDark ? "bg-amber-700/70 hover:bg-amber-700 text-white border border-amber-400/30" : "bg-amber-600 hover:bg-amber-700 text-white"}`}
+            >
+              فتح حماية Windows
+            </Button>
+          </motion.div>
+        )}
 
         {/* Advanced Options */}
         <motion.div className="w-full max-w-2xl" variants={itemVariants}>
@@ -294,15 +477,15 @@ export default function Home() {
               <TooltipTrigger asChild>
                 <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.97 }}>
                   <Button
-                    onClick={() => handleActivation("TSforge", "activate_tsforge", "tsforge")}
-                    disabled={isLoading}
+                    onClick={() => requestActivation({ label: "TSforge (الكل)", sub: "", kind: "tsforge", name: "TSforge" }, "tsforge")}
+                    disabled={busy}
                     className={`w-full rounded-lg py-6 font-semibold transition-all duration-300 ${
                       isDark
                         ? "bg-gradient-to-br from-violet-600 to-indigo-800 hover:from-violet-500 hover:to-indigo-700 text-white border border-violet-400/30"
                         : "bg-card text-[#1E293B] border border-slate-200 hover:border-violet-300 hover:bg-violet-50"
                     }`}
                   >
-                    {isLoading && activeAction === "TSforge" ? (
+                    {activeAction === "TSforge" && busy ? (
                       <Loader2 className="w-5 h-5 animate-spin ml-2" />
                     ) : null}
                     TSforge (الكل)
@@ -318,15 +501,15 @@ export default function Home() {
               <TooltipTrigger asChild>
                 <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.97 }}>
                   <Button
-                    onClick={() => handleActivation("Online KMS", "activate_kms", "onlinekms")}
-                    disabled={isLoading}
+                    onClick={() => requestActivation({ label: "Online KMS", sub: "", kind: "kms", name: "Online KMS" }, "onlinekms")}
+                    disabled={busy}
                     className={`w-full rounded-lg py-6 font-semibold transition-all duration-300 ${
                       isDark
                         ? "bg-gradient-to-br from-cyan-600 to-teal-800 hover:from-cyan-500 hover:to-teal-700 text-white border border-cyan-400/30"
                         : "bg-card text-[#1E293B] border border-slate-200 hover:border-cyan-300 hover:bg-cyan-50"
                     }`}
                   >
-                    {isLoading && activeAction === "Online KMS" ? (
+                    {activeAction === "Online KMS" && busy ? (
                       <Loader2 className="w-5 h-5 animate-spin ml-2" />
                     ) : null}
                     Online KMS
@@ -338,21 +521,50 @@ export default function Home() {
               </TooltipContent>
             </Tooltip>
           </div>
+
+          {/* Change Windows Edition (7.6) */}
+          <div className="mt-4">
+            <Button
+              onClick={() => setEditionDialog(true)}
+              disabled={busy}
+              className={`w-full rounded-lg py-5 font-semibold transition-all duration-300 border ${
+                isDark
+                  ? "bg-slate-800/60 hover:bg-slate-800 text-cyan-200 border-cyan-500/20"
+                  : "bg-card text-[#1E293B] border border-slate-200 hover:border-slate-300 hover:bg-slate-50"
+              }`}
+            >
+              <ArrowLeftRight className="w-5 h-5 ml-2" />
+              تغيير إصدار Windows
+            </Button>
+          </div>
         </motion.div>
 
         {/* Logs toggle button */}
-        {logs.length > 0 && (
+        <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
+          {logs.length > 0 && (
+            <motion.button
+              onClick={() => setShowLogs(!showLogs)}
+              className={`px-6 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${
+                isDark ? "bg-cyan-900/30 hover:bg-cyan-900/50 border border-cyan-500/30 text-cyan-300"
+                  : "bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-600"
+              }`}
+              variants={itemVariants}
+            >
+              {showLogs ? "إخفاء السجل" : "عرض السجل"}
+            </motion.button>
+          )}
           <motion.button
-            onClick={() => setShowLogs(!showLogs)}
-            className={`mt-8 px-6 py-2 rounded-lg text-sm font-medium transition-all duration-300 ${
+            onClick={handleExportReport}
+            className={`px-6 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all duration-300 ${
               isDark ? "bg-cyan-900/30 hover:bg-cyan-900/50 border border-cyan-500/30 text-cyan-300"
                 : "bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-600"
             }`}
             variants={itemVariants}
           >
-            {showLogs ? "إخفاء السجل" : "عرض السجل"}
+            <FileDown className="w-4 h-4" />
+            حفظ التقرير التشخيصي
           </motion.button>
-        )}
+        </div>
 
         {/* Logs display */}
         {showLogs && (
@@ -370,6 +582,30 @@ export default function Home() {
         statusLoading={statusLoading}
         statusResult={statusResult}
         logs={logs}
+        isDark={isDark}
+      />
+
+      {/* Edition Dialog (7.6) */}
+      <EditionDialog
+        open={editionDialog}
+        onOpenChange={setEditionDialog}
+        isDark={isDark}
+        onLog={addLog}
+      />
+
+      {/* Confirm Dialog (7.3) */}
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={pendingAction ? `تأكيد ${pendingAction.action.label}` : "تأكيد العملية"}
+        description={
+          pendingAction
+            ? `سيتم تنفيذ «${pendingAction.action.label}» على نظامك — يُنزَّل سكربت التفعيل من المصدر الرسمي massgrave.dev ويُنفَّذ بصلاحيات المسؤول. قد تستغرق العملية عدة دقائق. هل تريد المتابعة؟`
+            : ""
+        }
+        confirmLabel="متابعة التنفيذ"
+        loading={busy}
+        onConfirm={confirmAndRun}
         isDark={isDark}
       />
 
