@@ -5,7 +5,7 @@
 # 🖥️ MAS Activator
 ### أداة التفعيل الشاملة لـ Windows و Office
 
-[![version](https://img.shields.io/badge/version-2.2.1-blue?style=for-the-badge)](https://github.com/SMSMy/mas-activator-Disktop/releases)
+[![version](https://img.shields.io/badge/version-2.3.0-blue?style=for-the-badge)](https://github.com/SMSMy/mas-activator-Disktop/releases)
 [![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?style=for-the-badge&logo=windows)](https://github.com/SMSMy/mas-activator-Disktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8D8?style=for-the-badge&logo=tauri)](https://tauri.app)
 [![Rust](https://img.shields.io/badge/Rust-Language-CE422B?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
@@ -39,6 +39,7 @@
 | 🔁 **تغيير إصدار ويندوز** | منتقي إصدارات داخل التطبيق + تنفيذ عبر أدوات Windows الرسمية (changepk / slmgr / DISM) بدون مفاتيح في الكود |
 | ✅ **تحقق صادق** | مقارنة حالة الترخيص قبل/بعد كل عملية — لا نجاح زائف أبدًا |
 | 🔒 **سكربت مثبت ومُتحقق منه** | تحميل MAS من مصدر رسمي مع تحقق SHA-256 وكاش محلي (Ohook/TSforge يعملان أوفلاين) |
+| 🔑 **تجديد ذاتي بموافقتك** | عند صدور إصدار MAS جديد يطلب التطبيق اعتمادك الصريح — لا توقف للعمل ولا اعتماد صامت |
 | 📄 **تقرير تشخيصي** | حفظ تقرير آمن (منقّح من أي بيانات حساسة) لدعم فني أفضل |
 | ⏹️ **إلغاء ومهلات** | زر إلغاء ينهي العملية وشجرتها + مهلات تمنع العمليات المعلقة |
 | 🔄 **تحديث تلقائي** | يتحقق من التحديثات عند التشغيل ويفضّل النسخة المحمولة |
