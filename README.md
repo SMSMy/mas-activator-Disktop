@@ -147,7 +147,10 @@ Frontend:  React 19 + TypeScript + Tailwind CSS + Framer Motion
 Backend:   Rust (Tauri 2.x)
 Build:     Vite 7 + pnpm
 Language:  Arabic (RTL) واجهة عربية بالكامل
+Font:      خط عام الحرف اليدوية — وزارة الثقافة السعودية
 ```
+
+> ✒️ **الخط**: يعتمد التطبيق على «خط عام الحرف اليدوية» من مبادرة عام الحرف اليدوية بوزارة الثقافة — يُوزَّع مجانًا عبر المنصة الرسمية: [engage.moc.gov.sa/e/fonts/year-of-handcrafts](https://engage.moc.gov.sa/e/fonts/year-of-handcrafts/?lang=ar)
 
 ---
 
