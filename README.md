@@ -5,7 +5,7 @@
 # 🖥️ MAS Activator
 ### أداة التفعيل الشاملة لـ Windows و Office
 
-[![version](https://img.shields.io/badge/version-2.2.0-blue?style=for-the-badge)](https://github.com/SMSMy/mas-activator-Disktop/releases)
+[![version](https://img.shields.io/badge/version-2.2.1-blue?style=for-the-badge)](https://github.com/SMSMy/mas-activator-Disktop/releases)
 [![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?style=for-the-badge&logo=windows)](https://github.com/SMSMy/mas-activator-Disktop/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8D8?style=for-the-badge&logo=tauri)](https://tauri.app)
 [![Rust](https://img.shields.io/badge/Rust-Language-CE422B?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
