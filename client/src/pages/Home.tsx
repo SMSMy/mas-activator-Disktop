@@ -454,7 +454,7 @@ export default function Home() {
               تم حظر العملية بواسطة حماية النظام
             </p>
             <p className={`text-xs leading-relaxed ${isDark ? "text-amber-100/80" : "text-amber-800"}`}>
-              تذكير: أي تغيير في إعدادات الحماية قرارك — أعد التمكين فور انتهاء العملية.
+              تذكير: أي تغيير في إعدادات الحماية قرارك — أعد التمكين فور انتهاء العملية. إن وثقت بمصدر هذا التطبيق يمكنك استثناء ملفه من الفحص في حماية Windows.
             </p>
             <Button
               onClick={handleOpenWindowsSecurity}

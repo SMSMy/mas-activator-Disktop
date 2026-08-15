@@ -4,10 +4,10 @@ import NotFound from "@/pages/NotFound";
 import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { UpdateDialog } from "./components/UpdateDialog";
-import { ThemeProvider } from "./contexts/ThemeContext";
+import { ThemeProvider, useTheme } from "./contexts/ThemeContext";
 import { useUpdateCheck } from "./hooks/useUpdateCheck";
 import Home from "./pages/Home";
-
+import type { UpdateInfo } from "./hooks/useUpdateCheck";
 
 function Router() {
   return (
@@ -16,6 +16,26 @@ function Router() {
       <Route path={"/404"} component={NotFound} />
       <Route component={NotFound} />
     </Switch>
+  );
+}
+
+function ThemedUpdateDialog({
+  updateInfo,
+  showDialog,
+  setShowDialog,
+}: {
+  updateInfo: UpdateInfo | null;
+  showDialog: boolean;
+  setShowDialog: (open: boolean) => void;
+}) {
+  const { theme } = useTheme();
+  return (
+    <UpdateDialog
+      info={updateInfo}
+      open={showDialog}
+      onOpenChange={setShowDialog}
+      isDark={theme === "dark"}
+    />
   );
 }
 
@@ -31,10 +51,10 @@ function App() {
         <TooltipProvider>
           <Toaster />
           <Router />
-          <UpdateDialog
-            info={updateInfo}
-            open={showDialog}
-            onOpenChange={setShowDialog}
+          <ThemedUpdateDialog
+            updateInfo={updateInfo}
+            showDialog={showDialog}
+            setShowDialog={setShowDialog}
           />
         </TooltipProvider>
       </ThemeProvider>
