@@ -722,9 +722,12 @@ async fn run_activation(
     let before = collect_products().await.0;
 
     // تنفيذ السكربت المحلي المعتمد عبر cmd — بدون أي تحميل حي أو ScriptBlock
+    // raw_arg يمرر سطر الأوامر حرفيًا (cmd لا يفهم تهريب الشرطة المائلة للتنصيص)
     let command_line = format!("\"{}\" {}", mas_path.display(), switches);
     let mut cmd = tokio::process::Command::new("cmd");
-    cmd.args(["/D", "/S", "/C", &command_line]);
+    cmd.arg("/D");
+    cmd.arg("/C");
+    cmd.raw_arg(&command_line);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
@@ -2332,6 +2335,33 @@ The operation completed successfully.
         let parent = path.parent().unwrap();
         assert!(parent.ends_with("cache"));
         assert!(parent.to_string_lossy().contains("MAS Activator"));
+    }
+
+    #[test]
+    fn cmd_invocation_quoting_runs_batch_file_with_spaces() {
+        let dir = std::env::temp_dir().join("mas_quote_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake tool.cmd");
+        std::fs::write(&script, "@echo OK_MARKER\r\n").unwrap();
+
+        let command_line = format!("\"{}\" /HWID", script.display());
+        let out = StdCommand::new("cmd")
+            .arg("/D")
+            .arg("/C")
+            .raw_arg(&command_line)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("OK_MARKER"),
+            "stdout: {:?}\nstderr: {:?}",
+            stdout,
+            stderr
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
