@@ -26,7 +26,7 @@ tauri-plugin-log = "2"
 ureq = { version = "3", features = ["json"] }
 tokio = { version = "1", features = ["rt", "time", "process"] }
 semver = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [profile.release]
 opt-level = "s"
