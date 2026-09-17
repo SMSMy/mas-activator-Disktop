@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "MAS Activator",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "identifier": "com.masactivator.app",
   "build": {
     "frontendDist": "../dist/public",
-    "devUrl": "http://localhost:3000",
+    "devUrl": "http://localhost:3050",
     "beforeDevCommand": "pnpm dev",
     "beforeBuildCommand": "pnpm build"
   },

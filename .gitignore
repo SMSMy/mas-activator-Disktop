@@ -123,3 +123,9 @@ src-tauri/target/
 
 # Internal project review documents (not for publication)
 PROJECT_REVIEW_AND_REMEDIATION*.md
+
+# Local AI review artifacts (ocr runs, confirmations, aggregation, plans)
+.ocr/
+
+# Agent kit (local agent skills/knowledge — not part of the product source)
+agent-kit/

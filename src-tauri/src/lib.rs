@@ -1,6 +1,7 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,6 +14,7 @@ use tauri::State;
 use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const ICACLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 const UTF8_PREFIX: &str = r#"chcp 65001 > $null 2>&1; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; "#;
 
@@ -36,6 +38,9 @@ struct RunningOp {
 pub struct AppState {
     logs: Arc<Mutex<Vec<String>>>,
     current: Arc<Mutex<Option<RunningOp>>>,
+    /// لقطة «قبل» لتغيير الإصدار — تُخزَّن خادمياً عند preflight وتُستعمل أساساً
+    /// حصرياً للتحقق اللاحق (قراءة لحظية جديدة كـ«قبل» تجعل قبل==بعد دائماً)
+    edition_before: Arc<Mutex<Option<EditionSnapshot>>>,
 }
 
 // ===== النموذج المنظم (المرحلة 1.2) =====
@@ -175,6 +180,7 @@ fn is_insider(name: &str, description: &str) -> bool {
 
 fn office_clean_name(name: &str) -> String {
     let mut n = name.trim().to_string();
+    // بادئة مثل "Office 16, " (شكل أسماء SLP القديمة) تُزال ويبقى الرمز الفعلي بعدها
     if let Some(idx) = n.find(", ") {
         let head = &n[..idx];
         if head.to_uppercase().starts_with("OFFICE") {
@@ -184,7 +190,138 @@ fn office_clean_name(name: &str) -> String {
     if let Some(idx) = n.find(',') {
         n.truncate(idx);
     }
-    n.trim().to_string()
+    let t = n.trim().to_string();
+    // إزالة لاحقة " edition" إن وُجدت
+    let t = match t.strip_suffix(" edition") {
+        Some(s) => s.trim_end().to_string(),
+        None => t,
+    };
+
+    let up = t.to_ascii_uppercase();
+
+    // اكتشاف السنة: المضمنة أولاً (2019/2021/2024/2016/2013) ثم رمز العائلة الرقمي
+    let mut year: Option<u16> = None;
+    for (pat, y) in [
+        ("2024", 2024),
+        ("2021", 2021),
+        ("2019", 2019),
+        ("2016", 2016),
+        ("2013", 2013),
+    ] {
+        if up.contains(pat) {
+            year = Some(y);
+            break;
+        }
+    }
+    if year.is_none() {
+        for prefix in ["OFFICE", "PROJECT", "VISIO", "ACCESS", "ONENOTE"] {
+            if let Some(rest) = up.strip_prefix(prefix) {
+                let two: String = rest.chars().take(2).collect();
+                year = match two.parse::<u16>().ok() {
+                    Some(15) => Some(2013),
+                    Some(16) => Some(2016),
+                    Some(19) => Some(2019),
+                    Some(21) => Some(2021),
+                    Some(24) => Some(2024),
+                    _ => None,
+                };
+                break;
+            }
+        }
+    }
+
+    // تجريد الرمز إلى نواته: عائلة + رقم سنة (إن وجد) + علامة قناة + لاحقة ترخيص
+    let mut core = t.clone();
+    let cup = core.to_ascii_uppercase();
+    let mut family = "";
+    for prefix in ["OFFICE", "PROJECT", "VISIO", "ACCESS", "ONENOTE"] {
+        if cup.starts_with(prefix) {
+            family = prefix;
+            core = core[prefix.len()..].to_string();
+            if core.len() >= 2
+                && core[..2].chars().all(|c| c.is_ascii_digit())
+            {
+                core = core[2..].to_string();
+            }
+            break;
+        }
+    }
+    let is_ltsc = core.to_ascii_uppercase().contains("VL");
+    // إسقاط السنة المضمنة (HomeStudent2019R → HomeStudentR) ولاحقات الترخيص بعد '_'
+    for y in ["2024", "2021", "2019", "2016", "2013"] {
+        if let Some(pos) = core.find(y) {
+            core = format!("{}{}", &core[..pos], &core[pos + y.len()..]);
+            break;
+        }
+    }
+    if let Some(pos) = core.find('_') {
+        core = core[..pos].to_string();
+    }
+    // إسقاط علامة القناة VL الملتصقة بالنواة (ProPlusVL → ProPlus)
+    if core.to_ascii_uppercase().ends_with("VL") {
+        core = core[..core.len() - 2].to_string();
+    }
+    // إسقاط علامات R/أرقام متبقية في الذيل إن بقيت
+    core = core
+        .trim_end_matches(|c: char| c.is_ascii_digit() || c == 'R')
+        .to_string();
+    // في عائلتي Project وVisio الرمز المختصر (Pro/Std) يُمدّد لاسمه الكامل
+    if family == "PROJECT" || family == "VISIO" {
+        core = match core.to_ascii_uppercase().as_str() {
+            "PRO" => format!("{}PRO", family),
+            "STD" => format!("{}STD", family),
+            _ => core,
+        };
+    }
+    let core_up = core.to_ascii_uppercase();
+
+    // جدول الأسماء الودّية (اصطلاحات أسماء إصدارات Office المعروفة)
+    let friendly: Option<&str> = match core_up.as_str() {
+        "HOMESTUDENT" => Some("Home & Student"),
+        "HOMEBUSINESS" => Some("Home & Business"),
+        "PROPLUS" => Some("Professional Plus"),
+        "O365PROPLUS" | "MONDO" => Some("365"),
+        "PERSONAL" => Some("Personal"),
+        "PROFESSIONAL" => Some("Professional"),
+        "STANDARD" => Some("Standard"),
+        "PROJECTPRO" => Some("Project Professional"),
+        "PROJECTSTD" => Some("Project Standard"),
+        "VISIOPRO" => Some("Visio Professional"),
+        "VISIOSTD" => Some("Visio Standard"),
+        "ACCESS" => Some("Access"),
+        "ONENOTE" => Some("OneNote"),
+        "WORD" => Some("Word"),
+        "EXCEL" => Some("Excel"),
+        "POWERPOINT" => Some("PowerPoint"),
+        "PUBLISHER" => Some("Publisher"),
+        "OUTLOOK" => Some("Outlook"),
+        _ => None,
+    };
+
+    let Some(f) = friendly else {
+        // مجهول: أعد الرمز المنظف كما هو (السلوك السابق)
+        return t;
+    };
+
+    let ltsc = if is_ltsc && matches!(year, Some(2019) | Some(2021)) {
+        " (LTSC)"
+    } else {
+        ""
+    };
+    if f == "365" {
+        return "Office 365".to_string();
+    }
+    if family == "PROJECT" || family == "VISIO" || family == "ACCESS" || family == "ONENOTE" {
+        return match year {
+            Some(y) => format!("{} {}{}", f, y, ltsc),
+            None => format!("{}{}", f, ltsc),
+        };
+    }
+    // عائلة Office الاعتيادية
+    match year {
+        Some(y) => format!("Office {} {}{}", y, f, ltsc),
+        None => format!("Office {}{}", f, ltsc),
+    }
 }
 
 fn windows_clean_name(name: &str) -> String {
@@ -221,6 +358,60 @@ fn grace_days(minutes: i32) -> Option<u32> {
     }
 }
 
+/// حالة Office رقم 5 («إشعار ترخيص») هي ما تُبقيه تفعيلات Ohook على المنتج المرخّص
+/// فعلاً — فتُعرض «مفعل» ولا تُعدّ ناقصة. الحالة 4 (غير أصلية) تبقى كما هي.
+fn effective_state(kind: ProductKind, status: i32) -> LicenseState {
+    if kind == ProductKind::Office && status == 5 {
+        LicenseState::Activated
+    } else {
+        LicenseState::from_status(status)
+    }
+}
+
+fn effective_priority(kind: ProductKind, status: i32) -> u8 {
+    if kind == ProductKind::Office && status == 5 {
+        0
+    } else {
+        LicenseState::priority(status)
+    }
+}
+
+/// هل الحالة تعني «مفعّل بالفعل»؟ (لرسالة «لا حاجة للتفعيل»)
+fn effectively_activated(kind: ProductKind, status: i32) -> bool {
+    match kind {
+        ProductKind::Office => status == 1 || status == 5,
+        ProductKind::Windows => status == 1,
+    }
+}
+
+/// رسالة «لا حاجة للتفعيل» عند تساوي الحالتين المفعّلتين قبل/بعد
+fn already_activated_message(
+    kind: &str,
+    before_status: i32,
+    after_status: i32,
+) -> Option<(String, String)> {
+    if before_status != after_status {
+        return None;
+    }
+    let activated = match kind {
+        "windows" => effectively_activated(ProductKind::Windows, before_status),
+        "office" | "kms" => effectively_activated(ProductKind::Office, before_status),
+        _ => before_status == 1 || before_status == 5,
+    };
+    if !activated {
+        return None;
+    }
+    let product = match kind {
+        "windows" => "ويندوز",
+        "office" | "kms" => "أوفيس",
+        _ => "النظام",
+    };
+    Some((
+        "لا حاجة للتفعيل ✅".to_string(),
+        format!("{} مفعّل بالفعل ✅", product),
+    ))
+}
+
 fn select_best(
     products: &[RawProduct],
     predicate: impl Fn(&RawProduct) -> bool,
@@ -239,7 +430,14 @@ fn select_best(
         return None;
     }
 
-    candidates.sort_by_key(|p| LicenseState::priority(p.license_status));
+    candidates.sort_by_key(|p| {
+        let k = if is_windows(&p.application_id) {
+            ProductKind::Windows
+        } else {
+            ProductKind::Office
+        };
+        effective_priority(k, p.license_status)
+    });
     let best = *candidates.first()?;
 
     let kind = if is_windows(&best.application_id) {
@@ -257,11 +455,12 @@ fn select_best(
         "المنتج الوحيد المرصود"
     };
 
+    let state = effective_state(kind, best.license_status);
     Some(ProductStatus {
         kind,
         name,
-        state: LicenseState::from_status(best.license_status),
-        label: LicenseState::from_status(best.license_status).label(grace_days(best.grace_minutes)),
+        state,
+        label: state.label(grace_days(best.grace_minutes)),
         grace_days: grace_days(best.grace_minutes),
         selection_reason: reason.to_string(),
         license_status: best.license_status,
@@ -305,8 +504,8 @@ fn build_report(
             ProductKind::Office => 1,
         };
         ka.cmp(&kb).then(
-            LicenseState::priority(a.license_status)
-                .cmp(&LicenseState::priority(b.license_status)),
+            effective_priority(a.kind, a.license_status)
+                .cmp(&effective_priority(b.kind, b.license_status)),
         )
     });
 
@@ -378,16 +577,24 @@ fn mas_script_name() -> String {
     script_fragment(&["MAS", "_", "AIO", ".cmd"])
 }
 
-fn mas_download_url() -> String {
-    script_fragment(&[
-        "https://dev.azure.com/massgrave/Microsoft-Activation-Scripts/_apis/git/repositories/",
-        "Microsoft-Activation-Scripts/items?path=/MAS/All-In-One-Version-KL/",
-    ]) + &mas_script_name() + "&download=true"
+fn mas_download_url(tag: &str) -> String {
+    // المصدر الحي: GitHub raw — الوسم إلزامي والربط يتم بالوسم نفسه عبر عائلة مضيفات
+    // GitHub (api.github.com للبيان وraw.githubusercontent.com للمادة) — أي أن المادة
+    // والبيان مربوطان بالوسم لا بالمضيف الواحد حرفياً (التنزيل الاحتياطي مثبت على
+    // 3.12 — لا مرجع متحرك master إطلاقاً)
+    let url = script_fragment(&[
+        "https://raw.githubusercontent.com/massgravel/Microsoft-Activation-Scripts/",
+        tag,
+        "/MAS/All-In-One-Version-KL/",
+    ]);
+    url + &mas_script_name()
 }
 
 const MAS_EXPECTED_SHA256: &str = "850F979665FB93999ACAE93F4790C1FF8ED2041532060B7966A121C2D29A0BFA";
 const MAS_PINNED_TAG: &str = "3.12";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_MAS_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 300 * 1024 * 1024;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -395,12 +602,267 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:X}", hasher.finalize())
 }
 
+/// مجلد الكاش القديم (قبل 2.4.0) — يُهاجر محتواه إلى الموقع الجديد عند أول استخدام
+fn legacy_cache_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("MAS Activator").join("cache"))
+}
+
+/// نقل كاش السكربت القديم (قبل 2.4.0) إلى الموقع الجديد — فقط إذا طابق البصمة المضمنة.
+/// مرساة الاعتماد القديمة (pin-meta.json) لا تُهاجر أبداً: الاعتماد القديم لا ينتقل تلقائياً،
+/// ويعيد المستخدم الاعتماد عبر تدفق الموافقة — وهذا مقصود وموثّق هنا.
+fn migrate_legacy_cache(new_dir: &std::path::Path, legacy_dir: &std::path::Path) {
+    let legacy_script = legacy_dir.join(mas_script_name());
+    if legacy_script.exists() && !new_dir.join(mas_script_name()).exists() {
+        // يُنسخ القديم فقط إذا طابق البصمة المضمنة — أي محتوى آخر يُترك في مكانه بلا نقل
+        if let Ok(bytes) = std::fs::read(&legacy_script) {
+            if hash_matches_expected(&bytes) {
+                let _ = std::fs::copy(&legacy_script, new_dir.join(mas_script_name()));
+            }
+        }
+    }
+}
+
+/// مسبار كتابة فعلي: نجاح create_dir_all وحده لا يثبت صلاحية الكتابة (سياسات/ACL)
+fn probe_writable(dir: &std::path::Path) -> bool {
+    // اسم فريد لكل استدعاء (pid + عداد): لا تصادم بين استدعاءات متوازية
+    // ولا بقايا ثابتة الاسم يمكن زرعها مسبقاً
+    let probe = dir.join(format!(
+        ".write-probe-{}-{}",
+        std::process::id(),
+        NEXT_OP_ID.fetch_add(1, Ordering::SeqCst)
+    ));
+    if std::fs::write(&probe, b"x").is_err() {
+        return false;
+    }
+    // نجاح الحذف أو غياب الملف (NotFound) = نجاح المسبار؛ فشل الحذف لأي سبب آخر = فشل
+    match std::fs::remove_file(&probe) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+/// فرض ACL صريح على مجلد الكاش — يُنفَّذ دائماً بلا شرط «أنشأناه للتو»: مالِك أي مجلد
+/// تحت ProgramData غير محدود الإنشاء، ومستخدم عادي يستطيع إنشاء المجلد قبل أول تشغيل
+/// (يمنحه CREATOR OWNER سيطرة كاملة على ما ينشئ) فيتخطى أي تحصين مشروط بالإنشاء الحديث
+/// ويزرع كاشاً ومرساة متطابقين. الأسماء المحلية للغة («Administrators»/«Users»/«SYSTEM»)
+/// مستبدلة كلياً بالصيغ SID المستقلة عن لغة النظام: المسؤولون (S-1-5-32-544) والنظام
+/// (S-1-5-18) تحكم كامل، والمستخدمون (S-1-5-32-545) قراءة وتنفيذ فقط — بعد نقل الملكية
+/// إلى المسؤولين (/setowner) حتى لا يبقى للمنشئ العادي حق WRITE_DAC الضمني للمالك.
+/// icacls يُشغَّل بلا نافذة (CREATE_NO_WINDOW) وبمهلة قصوى 10 ثوانٍ: نمط child.try_wait
+/// في حلقة نوم قصيرة (بلا مكتبات جديدة) وقتل صريح عند تجاوز المهلة — فشل أي خطوة = false.
+/// تشغيل أمر icacls واحد على dir بالمعاملات المعطاة: بلا نافذة (CREATE_NO_WINDOW)
+/// وبمهلة قصوى 10 ثوانٍ (try_wait في حلقة نوم قصيرة وقتل صريح عند التجاوز).
+/// نجاح الخروج فقط = true.
+#[cfg(target_os = "windows")]
+fn run_icacls(dir: &std::path::Path, args: &[&str]) -> bool {
+    let mut cmd = StdCommand::new("icacls");
+    cmd.arg(dir);
+    cmd.args(args);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + ICACLS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // تجاوز المهلة: قتل صريح ثم جني الخروج لفترة قصيرة جداً
+                    let _ = child.kill();
+                    let reap_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) | Err(_) => return false,
+                            Ok(None) if std::time::Instant::now() >= reap_deadline => {
+                                return false;
+                            }
+                            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn harden_cache_acl(dir: &std::path::Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // استدعاءات منفصلة عمداً: دمج /setowner أو /reset مع /inheritance:r و/grant:r
+        // في أمر واحد يفشل في بعض إصدارات icacls برسالة «Invalid parameter» (رُصد حياً
+        // في بيئة الاختبار) — فصل العمليات هو الصيغة الموثوقة.
+        // 1) أخذ الملكية أولاً: مالك المجلد يحتفظ بحق WRITE_DAC الضمني، فلو أنشأه
+        //    مستخدم عادي مسبقاً بقي مالكاً وبوسعه إعادة كتابة الـDACL حتى بعد التحصين —
+        //    نقل الملكية للمسؤولين يغلق هذا المنفذ نهائياً (يملكه التطبيق المرتفع)
+        if !run_icacls(dir, &["/setowner", "*S-1-5-32-544"]) {
+            return false;
+        }
+        // 2) تصفير الـDACL: /reset يعيد القائمة إلى الوراثة الافتراضية ويسقط أي
+        //    ACE صريحة زرعها منشئ المجلد مسبقاً (مستخدم عادي منح نفسه F مثلاً) —
+        //    /inheritance:r وحده لا يزيل الصريحة، فيبقى للمهاجم حق زرع المحتوى
+        if !run_icacls(dir, &["/reset"]) {
+            return false;
+        }
+        // 3) تحصين DACL: لا وراثة + المسؤولون والنظام تحكم كامل + المستخدمون قراءة وتنفيذ
+        run_icacls(
+            dir,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-545:(OI)(CI)RX",
+            ],
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = dir;
+        true
+    }
+}
+
+/// التحديد الفعلي لمجلد الكاش (نجاحه وحده يُخزَّن لكل عملية عبر CACHE_DIR —
+/// فشل عابر لا يُخزَّن أبداً فتعيد المحاولة القادمة الحساب).
+/// على ويندوز المسار الوحيد المقبول هو ProgramData — فشل أي خطوة من (أ-هـ) = Err
+/// عربي صريح بلا أي احتياط إلى موقع أقل حماية (لا LOCALAPPDATA إطلاقاً):
+/// (أ) رفض نقطة إعادة التحليل إن وُجدت على الوالد الوسيط «ProgramData\MAS Activator»
+///     وعلى الورقة (symlink/junction قد يوجه الكاش خارج السيطرة المتوقعة)؛
+/// (ب) create_dir_all؛ (ج) تحصين icacls بالصيغ SID — دائماً وبلا شرط الإنشاء الحديث
+///     (إصلاح ثغرة الإنشاء المسبق)؛ (د) مسبار كتابة فعلي باسم فريد ومتسامح مع
+///     NotFound؛ (هـ) نجاح الكل = قبول الموقع.
+/// على غير ويندوز يُحفظ السلوك السابق كما هو: محاولة ProgramData ثم احتياط
+/// LOCALAPPDATA مع المسبار.
+fn resolve_cache_dir_uncached() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let program_data = std::env::var("PROGRAMDATA").map_err(|_| {
+            "تعذر تجهيز مجلد الكاش الآمن في ProgramData: متغير PROGRAMDATA غير معرّف"
+                .to_string()
+        })?;
+        let parent = PathBuf::from(&program_data).join("MAS Activator");
+        let base = parent.join("cache");
+        // (أ1) فحص نقطة إعادة التحليل على الوالد الوسيط قبل فحص الورقة
+        match std::fs::symlink_metadata(&parent) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err("تعذر تجهيز مجلد الكاش الآمن في ProgramData: الوالد الوسيط «MAS Activator» نقطة إعادة تحليل (symlink/junction)".to_string());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "تعذر تجهيز مجلد الكاش الآمن في ProgramData: تعذر فحص الوالد الوسيط: {}",
+                    e
+                ));
+            }
+        }
+        // (أ2) فحص نقطة إعادة التحليل على الورقة (الغائب يُنشأ في الخطوة التالية)
+        match std::fs::symlink_metadata(&base) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err("تعذر تجهيز مجلد الكاش الآمن في ProgramData: المسار نقطة إعادة تحليل (symlink/junction)".to_string());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "تعذر تجهيز مجلد الكاش الآمن في ProgramData: تعذر فحص المسار: {}",
+                    e
+                ));
+            }
+        }
+        // (ب) إنشاء المجلد (متحمل لوجوده مسبقاً) — الفشل Err بلا احتياط
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "تعذر تجهيز مجلد الكاش الآمن في ProgramData: تعذر إنشاء المجلد: {}",
+                e
+            )
+        })?;
+        // (ج) التحصين دائماً — حتى لو وُجد المجلد قبلنا: تخطي التحصين عند الوجود
+        // المسبق يترك للمستخدم العادي (الذي أنشأه ويملكه) كاشاً ومرساة متطابقين
+        if !harden_cache_acl(&base) {
+            return Err(
+                "تعذر تجهيز مجلد الكاش الآمن في ProgramData: فشل تحصين المجلد (icacls)"
+                    .to_string(),
+            );
+        }
+        // (د) مسبار الكتابة الفعلي شرط قبول الموقع — بعد التحصين لا قبله
+        if !probe_writable(&base) {
+            return Err(
+                "تعذر تجهيز مجلد الكاش الآمن في ProgramData: تعذر الكتابة الفعلية في المجلد"
+                    .to_string(),
+            );
+        }
+        // (هـ) نجاح الكل = قبول الموقع
+        if let Some(legacy) = legacy_cache_dir() {
+            migrate_legacy_cache(&base, &legacy);
+        }
+        Ok(base)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // غير ويندوز: السلوك السابق كما هو — محاولة ProgramData ثم احتياط LOCALAPPDATA
+        if let Ok(program_data) = std::env::var("PROGRAMDATA") {
+            let base = PathBuf::from(program_data).join("MAS Activator").join("cache");
+            // (أ) رفض نقطة إعادة التحليل إن كان المسار موجوداً (الغائب يُنشأ في الخطوة التالية)
+            let is_reparse = std::fs::symlink_metadata(&base)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_reparse {
+                // (ب) إنشاء المجلد (متحمل لوجوده مسبقاً)
+                if std::fs::create_dir_all(&base).is_ok() {
+                    // (ج) التحصين دائماً — حتى لو وُجد المجلد قبلنا
+                    if harden_cache_acl(&base) {
+                        // (د) مسبار الكتابة الفعلي شرط قبول الموقع — بعد التحصين لا قبله
+                        if probe_writable(&base) {
+                            if let Some(legacy) = legacy_cache_dir() {
+                                migrate_legacy_cache(&base, &legacy);
+                            }
+                            return Ok(base);
+                        }
+                    }
+                }
+            }
+        }
+        // الاحتياط: الموقع القديم عند فشل أي خطوة في ProgramData — create_dir_all ومسبار فقط
+        // (بلا icacls: مجلد LOCALAPPDATA خاص بالمستخدم ولا يحتاج تحصيناً من مستخدمين آخرين)
+        let base = std::env::var("LOCALAPPDATA")
+            .map(|p| PathBuf::from(p).join("MAS Activator").join("cache"))
+            .map_err(|_| "تعذر تحديد مجلد التخزين المحلي".to_string())?;
+        std::fs::create_dir_all(&base).map_err(|e| format!("تعذر إنشاء مجلد الكاش: {}", e))?;
+        if !probe_writable(&base) {
+            return Err(format!("تعذر الكتابة في مجلد الكاش: {}", base.display()));
+        }
+        Ok(base)
+    }
+}
+
+/// نتيجة تحديد مجلد الكاش تُخزَّن في الذاكرة لكل عملية: icacls والمسبار لا يتكرران
+/// في كل استدعاء (تُستدعى من resolve_cache_path وpin_meta_path عدة مرات).
+/// النجاح وحده يُخزَّن — الفشل لا يُخزَّن أبداً: خطأ عابر لا يبقى محفوراً للأبد
+/// (سلوك OnceLock<Result<..>> القديم) بل تُعاد محاولة الحساب في الاستدعاء القادم.
+static CACHE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 fn resolve_cache_dir() -> Result<PathBuf, String> {
-    let base = std::env::var("LOCALAPPDATA")
-        .map(|p| PathBuf::from(p).join("MAS Activator").join("cache"))
-        .map_err(|_| "تعذر تحديد مجلد التخزين المحلي".to_string())?;
-    std::fs::create_dir_all(&base).map_err(|e| format!("تعذر إنشاء مجلد الكاش: {}", e))?;
-    Ok(base)
+    // قراءة سريعة تحت القفل: قيمة محسوبة سابقاً = إعادة فورية
+    let cached = CACHE_DIR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(dir) = cached {
+        return Ok(dir);
+    }
+    // الحساب خارج القفل (لا deadlock: resolve_cache_dir_uncached لا يستدعي
+    // resolve_cache_dir أبداً — لا استدعاء متداخل لنفس القفل)
+    let dir = resolve_cache_dir_uncached()?;
+    // النجاح وحده يُخزَّن؛ الفشل أُعيد أعلاه بلا تخزين
+    let mut guard = CACHE_DIR.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(dir.clone());
+    Ok(dir)
 }
 
 fn resolve_cache_path() -> Result<PathBuf, String> {
@@ -413,16 +875,27 @@ fn hash_matches_expected(bytes: &[u8]) -> bool {
 
 // ===== دبوس يتجدد ذاتيًا بموافقة المستخدم (عمر طويل دون تحديث التطبيق) =====
 
-fn parse_tag(t: &str) -> Vec<u32> {
-    t.trim_start_matches('v')
-        .split('.')
-        .filter_map(|p| p.parse::<u32>().ok())
-        .collect()
+/// تحليل وسم إصدار رقمي صرف: أي مقطع غير رقمي (بما فيها اللواحق مثل 3.13-beta) = فشل
+fn parse_tag(t: &str) -> Option<Vec<u32>> {
+    let trimmed = t.trim_start_matches('v');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for p in trimmed.split('.') {
+        if p.is_empty() {
+            return None;
+        }
+        parts.push(p.parse::<u32>().ok()?);
+    }
+    Some(parts)
 }
 
 fn tag_is_newer(a: &str, b: &str) -> bool {
-    let va = parse_tag(a);
-    let vb = parse_tag(b);
+    // الوسم غير الرقمي لا يُعامل «أحدث» إطلاقاً
+    let (Some(va), Some(vb)) = (parse_tag(a), parse_tag(b)) else {
+        return false;
+    };
     let n = va.len().max(vb.len());
     for i in 0..n {
         let x = va.get(i).copied().unwrap_or(0);
@@ -445,10 +918,23 @@ fn pin_meta_path() -> Result<PathBuf, String> {
     Ok(resolve_cache_dir()?.join("pin-meta.json"))
 }
 
-fn load_pin_meta() -> Option<PinMeta> {
-    let path = pin_meta_path().ok()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+/// تمييز المرساة (مساعد نقي قابل للاختبار دون لمس مسار الكاش الحقيقي):
+/// Ok(None) = لا ملف (لا اعتماد مسجل)، Err = ملف موجود لكنه تالف أو غير قابل للقراءة
+/// (برسالة عربية «تالف» — لا يُبتلع كغياب)
+fn load_pin_meta_from(path: &std::path::Path) -> Result<Option<PinMeta>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("تعذر قراءة ملف الاعتماد المحفوظ: {}", e)),
+    };
+    serde_json::from_str::<PinMeta>(&raw)
+        .map(Some)
+        .map_err(|e| format!("ملف الاعتماد المحفوظ تالف: {}", e))
+}
+
+/// قراءة المرساة: Ok(None) = لا مرساة، Err = مرساة تالفة (تُميَّز برسالة عربية ولا تُبتلع)
+fn load_pin_meta() -> Result<Option<PinMeta>, String> {
+    load_pin_meta_from(&pin_meta_path()?)
 }
 
 fn save_pin_meta(meta: &PinMeta) -> Result<(), String> {
@@ -463,98 +949,210 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-async fn download_mas_script() -> Result<Vec<u8>, String> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .user_agent("MAS-Activator")
-            .timeout_global(Some(DOWNLOAD_TIMEOUT))
-            .build(),
-    );
-    let response = agent
-        .get(mas_download_url())
-        .call()
-        .map_err(|e| format!("تعذر تنزيل سكربت التفعيل: {}", e))?;
-    response
-        .into_body()
-        .read_to_vec()
-        .map_err(|e| format!("خطأ أثناء تنزيل السكربت: {}", e))
+async fn download_mas_script(tag: Option<String>) -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(move || {
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .user_agent("MAS-Activator")
+                .timeout_global(Some(DOWNLOAD_TIMEOUT))
+                .build(),
+        );
+        // الوسم إلزامي في بناء الرابط: بلا وسم صريح = الوسم المثبت MAS_PINNED_TAG
+        // (لا مرجع متحرك master إطلاقاً — كل استدعاء يمرر وسمه صراحة)
+        let url = mas_download_url(tag.as_deref().unwrap_or(MAS_PINNED_TAG));
+        let response = agent
+            .get(&url)
+            .call()
+            .map_err(|e| format!("تعذر تنزيل سكربت التفعيل: {}", e))?;
+        // قراءة محدودة (سقف 10MB عند التنزيل): بلوغ الحد يُرفض برسالة عربية —
+        // لا يُقرأ تنزيل غير منتهٍ في الذاكرة (سقف العقلانية الأصغر 5MB يطبَّق
+        // لاحقاً في validate_mas_payload قبل التبني)
+        response
+            .into_body()
+            .into_with_config()
+            .limit(MAX_MAS_DOWNLOAD_BYTES)
+            .read_to_vec()
+            .map_err(|e| match e {
+                ureq::Error::BodyExceedsLimit(_) => {
+                    "تجاوزت الحمولة حد الحجم الآمن (10 ميجابايت) — لم يُقبل أي محتوى".to_string()
+                }
+                other => format!("خطأ أثناء تنزيل السكربت: {}", other),
+            })
+    })
+    .await
+    .map_err(|e| format!("خطأ في المعالجة أثناء تنزيل السكربت: {}", e))?
 }
 
 async fn fetch_mas_latest_tag() -> Result<String, String> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .user_agent("MAS-Activator")
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build(),
-    );
-    let response = agent
-        .get("https://api.github.com/repos/massgravel/Microsoft-Activation-Scripts/releases/latest")
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .map_err(|e| format!("تعذر الاستعلام عن إصدار سكربت التفعيل: {}", e))?;
-    let json: serde_json::Value = response
-        .into_body()
-        .read_json()
-        .map_err(|e| format!("تعذر قراءة بيانات الإصدار: {}", e))?;
-    json.get("tag_name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_start_matches('v').to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "بيانات الإصدار غير متوقعة".to_string())
+    tokio::task::spawn_blocking(|| {
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .user_agent("MAS-Activator")
+                .timeout_global(Some(Duration::from_secs(60)))
+                .build(),
+        );
+        let response = agent
+            .get("https://api.github.com/repos/massgravel/Microsoft-Activation-Scripts/releases/latest")
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .map_err(|e| format!("تعذر الاستعلام عن إصدار سكربت التفعيل: {}", e))?;
+        let json: serde_json::Value = response
+            .into_body()
+            .read_json()
+            .map_err(|e| format!("تعذر قراءة بيانات الإصدار: {}", e))?;
+        // الوسم يُعاد خاماً كما ورد من GitHub (بلا تقشير 'v'): يُخزَّن خاماً في المرساة
+        // ويُستعمل خاماً مرجعاً لرابط التنزيل — التقشير يتم داخلياً في parse_tag/tag_is_newer
+        // عند المقارنات الرقمية فقط
+        json.get("tag_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "بيانات الإصدار غير متوقعة".to_string())
+    })
+    .await
+    .map_err(|e| format!("خطأ في المعالجة أثناء الاستعلام عن الإصدار: {}", e))?
+}
+
+/// مصدر التحقق الذي قبل محتوى السكربت
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifySource {
+    /// تحقق بالبصمة المضمنة في التطبيق (MAS_EXPECTED_SHA256) — من الكاش أو تنزيل طازج
+    Embedded,
+    /// تحقق بالبصمة المتبناة (pin-meta.json)
+    Adopted,
+}
+
+impl VerifySource {
+    fn label(&self) -> &'static str {
+        match self {
+            VerifySource::Embedded => "بصمة مضمّنة",
+            VerifySource::Adopted => "بصمة متبناة",
+        }
+    }
+}
+
+/// تصنيف محتوى ضد بصمات التحقق (نقية وقابلة للاختبار):
+/// البصمة المضمنة أولاً ثم بصمة المرساة المسجلة إن وُجدت — المصدر يعكس البصمة
+/// التي طابقت بالفعل (Embedded أو Adopted)
+fn classify_content(hash: &str, meta: Option<&PinMeta>) -> Option<VerifySource> {
+    if hash.eq_ignore_ascii_case(MAS_EXPECTED_SHA256) {
+        return Some(VerifySource::Embedded);
+    }
+    if let Some(m) = meta {
+        if hash.eq_ignore_ascii_case(&m.sha256) {
+            return Some(VerifySource::Adopted);
+        }
+    }
+    None
 }
 
 enum ScriptResolution {
-    Ready(PathBuf, bool),
+    Ready {
+        path: PathBuf,
+        from_cache: bool,
+        fingerprint: String,
+        source: VerifySource,
+    },
     NeedsAdoption { from_tag: String, to_tag: String },
     NoConnection(String),
     Integrity(String),
     Io(String),
 }
 
-/// إرجاع مسار سكربت MAS الجاهز للتشغيل + هل أتى من الكاش.
+/// إرجاع مسار سكربت MAS الجاهز للتشغيل + هل أتى من الكاش + البصمة الفعلية ومصدر تحققها.
 /// السياسة: الكاش المطابق للبصمة المعتمدة (المضمنة أو المتبناة) = تشغيل.
 /// محتوى غير مطابق + إصدار رسمي أحدث = اعتماد بموافقة المستخدم.
-async fn ensure_mas_script() -> ScriptResolution {
+async fn ensure_mas_script(state: &State<'_, AppState>) -> ScriptResolution {
     let cache_path = match resolve_cache_path() {
         Ok(p) => p,
         Err(e) => return ScriptResolution::Io(e),
     };
 
     let cache_bytes = std::fs::read(&cache_path).ok();
-    let meta = load_pin_meta();
 
-    let embedded_match = cache_bytes
-        .as_deref()
-        .map(hash_matches_expected)
-        .unwrap_or(false);
-    let recorded_match = match (&cache_bytes, &meta) {
-        (Some(b), Some(m)) => sha256_hex(b).eq_ignore_ascii_case(&m.sha256),
-        _ => false,
+    // مرساة تالفة = تحذير عربي + معاملة «لا دبوس» (لا فشل قاسٍ)
+    let meta: Option<PinMeta> = match load_pin_meta() {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = push_log(
+                state,
+                &format!("[WARN] {} — ستُعامل الحالة كأن لا اعتماد مسجلاً", e),
+            );
+            None
+        }
     };
 
-    if embedded_match || recorded_match {
-        return ScriptResolution::Ready(cache_path, true);
-    }
-
-    // محاولة تنزيل طازج
-    let downloaded = download_mas_script().await;
-    if let Ok(bytes) = &downloaded {
+    if let Some(bytes) = cache_bytes.as_deref() {
         if hash_matches_expected(bytes) {
-            let _ = std::fs::write(&cache_path, bytes);
-            return ScriptResolution::Ready(cache_path, false);
+            return ScriptResolution::Ready {
+                path: cache_path,
+                from_cache: true,
+                fingerprint: sha256_hex(bytes),
+                source: VerifySource::Embedded,
+            };
+        }
+        if let Some(m) = &meta {
+            let hash = sha256_hex(bytes);
+            if hash.eq_ignore_ascii_case(&m.sha256) {
+                return ScriptResolution::Ready {
+                    path: cache_path,
+                    from_cache: true,
+                    fingerprint: hash,
+                    source: VerifySource::Adopted,
+                };
+            }
         }
     }
 
-    // عدم تطابق: نحدد الإصدار الرسمي الأحدث
+    // محاولة تنزيل طازج بوسم المرساة المعتمدة: الوسم المختار = وسم المرساة إن وُجد
+    // صالحاً رقمياً (parse_tag) وإلا الثابت المضمن MAS_PINNED_TAG — يحفظ الاسترجاع
+    // للاعتماد السابق بدل الرجوع الصامت إلى 3.12 (لا مرجع متحرك master إطلاقاً).
+    // يُقبل فقط إذا طابق البصمة المضمنة أو بصمة المرساة المسجلة — أي تطابق يعيد
+    // Ready بمصدر البصمة التي طابقت (Embedded أو Adopted)
+    let download_tag = meta
+        .as_ref()
+        .filter(|m| parse_tag(&m.version_tag).is_some())
+        .map(|m| m.version_tag.clone())
+        .unwrap_or_else(|| MAS_PINNED_TAG.to_string());
+    let downloaded = download_mas_script(Some(download_tag)).await;
+    if let Ok(bytes) = &downloaded {
+        let hash = sha256_hex(bytes);
+        if let Some(source) = classify_content(&hash, meta.as_ref()) {
+            // التنزيل الطازج المطابق للبصمة المضمنة أو المسجلة يُقبل Ready بدل
+            // إعادة طلب الاعتماد (إصلاح S2)
+            if let Err(e) = std::fs::write(&cache_path, bytes) {
+                return ScriptResolution::Io(format!("تعذر حفظ سكربت التفعيل في الكاش: {}", e));
+            }
+            return ScriptResolution::Ready {
+                path: cache_path,
+                from_cache: false,
+                fingerprint: hash,
+                source,
+            };
+        }
+    }
+
+    // أساس المقارنة والوسم المعروض: المساعد الموحّد (نفس القاعدة في ensure وفي adopt)
+    let base_tag = adoption_baseline(meta.as_ref());
+
     match fetch_mas_latest_tag().await {
-        Ok(latest) if tag_is_newer(&latest, MAS_PINNED_TAG) => ScriptResolution::NeedsAdoption {
-            from_tag: MAS_PINNED_TAG.to_string(),
+        Ok(latest) if tag_is_newer(&latest, &base_tag) => ScriptResolution::NeedsAdoption {
+            from_tag: base_tag,
             to_tag: latest,
         },
-        Ok(latest) => ScriptResolution::Integrity(format!(
-            "التحقق من سلامة سكربت التفعيل فشل (الإصدار الرسمي {} ليس أحدث من المعتمد) — لم يُنفذ أي شيء.",
-            latest
-        )),
+        Ok(latest) => {
+            if parse_tag(&latest).is_none() {
+                ScriptResolution::Integrity(format!(
+                    "تعذر فهم وسم الإصدار الرسمي ({} — ليس رقماً صرفاً) — لم يُنفذ أي شيء.",
+                    latest
+                ))
+            } else {
+                ScriptResolution::Integrity(format!(
+                    "التحقق من سلامة سكربت التفعيل فشل (الإصدار الرسمي {} ليس أحدث من المعتمد {}) — لم يُنفذ أي شيء.",
+                    latest, base_tag
+                ))
+            }
+        }
         Err(tag_err) => {
             if downloaded.is_err() {
                 match cache_bytes {
@@ -576,27 +1174,128 @@ async fn ensure_mas_script() -> ScriptResolution {
     }
 }
 
-#[tauri::command]
-async fn adopt_mas_pin() -> Result<String, String> {
-    let bytes = download_mas_script().await?;
-    let latest_tag = fetch_mas_latest_tag().await?;
-    if !tag_is_newer(&latest_tag, MAS_PINNED_TAG) {
-        return Err("الإصدار الرسمي ليس أحدث من المعتمد — لم يُعتمد أي شيء".to_string());
+/// هل يُسمح باعتماد هذا الوسم قياساً بالأساس المعطى؟ (مساعد نقي قابل للاختبار)
+fn adoption_allowed(latest: &str, baseline: &str) -> bool {
+    tag_is_newer(latest, baseline)
+}
+
+/// الأساس الموحّد لمقارنات الاعتماد: وسم المرساة إن وُجد صالحاً، وإلا الثابت المضمن.
+/// قاعدة واحدة يستخدمها كلا الموضعين (ensure وadopt) حتى لا يتبقى موضعان بقاعدتين مختلفتين.
+fn adoption_baseline(meta: Option<&PinMeta>) -> String {
+    meta.filter(|m| parse_tag(&m.version_tag).is_some())
+        .map(|m| m.version_tag.clone())
+        .unwrap_or_else(|| MAS_PINNED_TAG.to_string())
+}
+
+/// فحص عقلانية الحمولة قبل تثبيتها مرساة (ضد بصمة TOFU ذاتية)
+fn validate_mas_payload(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("الحمولة المُنزَّلة فارغة — لم يُعتمد أي شيء".to_string());
     }
-    let cache_path = resolve_cache_path()?;
-    std::fs::write(&cache_path, &bytes).map_err(|e| format!("تعذر حفظ السكربت: {}", e))?;
-    let meta = PinMeta {
-        version_tag: latest_tag.clone(),
-        sha256: sha256_hex(&bytes),
-        adopted_at: now_unix(),
+    if bytes.len() < 100 * 1024 || bytes.len() > 5 * 1024 * 1024 {
+        return Err(
+            "حجم الحمولة المُنزَّلة خارج الحدود المعقولة (100KB–5MB) — لم يُعتمد أي شيء"
+                .to_string(),
+        );
+    }
+    let head = String::from_utf8_lossy(&bytes[..512]).to_ascii_lowercase();
+    if head.contains("<html") || head.contains("<!doctype") {
+        return Err("الحمولة المُنزَّلة ليست سكربتاً (استجابة HTML) — لم يُعتمد أي شيء".to_string());
+    }
+    if bytes[..256].contains(&0) {
+        return Err("الحمولة المُنزَّلة ليست نصاً (محتوى ثنائي) — لم يُعتمد أي شيء".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn adopt_mas_pin(state: State<'_, AppState>) -> Result<String, String> {
+    // حجز خانة العملية فوراً داخل كتلة القفل نفسها (قبل أي await شبكي): اعتماد متوازٍ مرفوض
+    let op_id = {
+        let mut current = state
+            .current
+            .lock()
+            .map_err(|_| "تعذر الوصول إلى حالة العمليات".to_string())?;
+        if current.is_some() {
+            return Err("هناك عملية أخرى قيد التنفيذ".to_string());
+        }
+        let id = NEXT_OP_ID.fetch_add(1, Ordering::SeqCst);
+        *current = Some(RunningOp {
+            id,
+            kind: "adopt_mas_pin".to_string(),
+            pid: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let _ = push_log(&state, &format!("[INFO] العملية #{}: adopt_mas_pin", id));
+        id
     };
-    save_pin_meta(&meta)?;
-    Ok(format!(
-        "اعتُمد الإصدار {} من سكربت التفعيل (بصمة {}...)",
-        latest_tag,
-        &meta.sha256[..8]
-    ))
- }
+
+    // نمط موحّد: النتيجة تُحسب كاملة في متغير، ثم يُمسح الحجز، ثم تُعاد —
+    // لا يوجد مسار إرجاع (نجاحاً أو خطأً) إلا ويمر بالمسح
+    let result = (async {
+        let latest_tag = fetch_mas_latest_tag().await?;
+        // أساس المقارنة موحّد: المرساة الحالية إن وُجدت صالحة، وإلا الثابت المضمن
+        let meta: Option<PinMeta> = match load_pin_meta() {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = push_log(
+                    &state,
+                    &format!("[WARN] {} — ستُعامل الحالة كأن لا اعتماد مسجلاً", e),
+                );
+                None
+            }
+        };
+        let baseline = adoption_baseline(meta.as_ref());
+        if !adoption_allowed(&latest_tag, &baseline) {
+            return Err("الإصدار الرسمي ليس أحدث من المعتمد — لم يُعتمد أي شيء".to_string());
+        }
+        // التحميل بنفس الوسم المعتمد: المادة والبيان مربوطان بالوسم نفسه عبر عائلة
+        // مضيفات GitHub (api.github.com للبيان وraw.githubusercontent.com للمادة) —
+        // لا بالمضيف الواحد حرفياً
+        let bytes = download_mas_script(Some(latest_tag.clone())).await?;
+        validate_mas_payload(&bytes)?;
+
+        let cache_path = resolve_cache_path()?;
+        // اسم مؤقت فريد لكل استدعاء (يضمّن رقم العملية): لا تصادم بين استدعاءين
+        // ولا بقايا ثابتة الاسم يمكن زرعها مسبقاً
+        let tmp_path = cache_path.with_extension(format!("tmp-{}-download", op_id));
+        // كتابة ذرية: ملف مؤقت ثم rename
+        std::fs::write(&tmp_path, &bytes).map_err(|e| format!("تعذر حفظ السكربت: {}", e))?;
+        if let Err(e) = std::fs::rename(&tmp_path, &cache_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("تعذر تثبيت السكربت في الكاش: {}", e));
+        }
+
+        let meta = PinMeta {
+            version_tag: latest_tag.clone(),
+            sha256: sha256_hex(&bytes),
+            adopted_at: now_unix(),
+        };
+        // عند فشل حفظ المرساة: احذف الكاش الجديد (لا يُترك محتوى بلا مرساة)
+        if let Err(e) = save_pin_meta(&meta) {
+            let _ = std::fs::remove_file(&cache_path);
+            return Err(format!("تعذر حفظ بيانات الاعتماد: {}", e));
+        }
+
+        let short = meta.sha256.get(..8).unwrap_or(&meta.sha256);
+        let _ = push_log(
+            &state,
+            &format!(
+                "[ADOPT] اعتُمد الإصدار {} من سكربت التفعيل (بصمة {}...، وقت {})",
+                latest_tag, short, meta.adopted_at
+            ),
+        );
+        Ok(format!(
+            "اعتُمد الإصدار {} من سكربت التفعيل (بصمة {}...)",
+            latest_tag, short
+        ))
+    })
+    .await;
+
+    // المسح قبل إعادة النتيجة في كل المسارات (نمط واحد موحّد)
+    clear_current(&state)?;
+    result
+}
 
 // ===== أدوات PowerShell =====
 
@@ -639,7 +1338,7 @@ try {
             grace_minutes = [int]$_.GracePeriodRemaining
         }
     })
-    Write-Output ('{"checked_at":"' + $checked + '","items":' + ($items | ConvertTo-Json -Compress -Depth 2) + '}')
+    Write-Output ('{"checked_at":"' + $checked + '","items":' + (ConvertTo-Json -Compress -Depth 2 -InputObject $items) + '}')
 } catch {
     Write-Output ('{"checked_at":"' + $checked + '","cim_error":"' + ($_.Exception.Message -replace '"','\"') + '"}')
 }
@@ -841,21 +1540,37 @@ async fn run_activation(
         _ => return Err("نوع عملية غير معروف".to_string()),
     };
 
-    {
-        let current = state
+    // حجز خانة العملية فوراً داخل كتلة القفل نفسها (قبل أي await شبكي) — إصلاح TOCTOU
+    let cancel_flag = {
+        let mut current = state
             .current
             .lock()
             .map_err(|_| "تعذر الوصول إلى حالة العمليات".to_string())?;
         if current.is_some() {
             return Err("هناك عملية أخرى قيد التنفيذ".to_string());
         }
-    }
+        let flag = Arc::new(AtomicBool::new(false));
+        let op = RunningOp {
+            id: NEXT_OP_ID.fetch_add(1, Ordering::SeqCst),
+            kind: kind.clone(),
+            pid: None,
+            cancel: flag.clone(),
+        };
+        let _ = push_log(&state, &format!("[INFO] العملية #{}: {}", op.id, op.kind));
+        *current = Some(op);
+        flag
+    };
 
     let _ = push_log(&state, &format!("[INFO] جاري تنفيذ: {} ...", label));
 
     // 4.1: مصدر مثبت + تحقق سلامة + كاش محلي + دبوس يتجدد بموافقة المستخدم
-    let (mas_path, from_cache) = match ensure_mas_script().await {
-        ScriptResolution::Ready(path, cached) => (path, cached),
+    let (mas_path, from_cache, fingerprint, source) = match ensure_mas_script(&state).await {
+        ScriptResolution::Ready {
+            path,
+            from_cache,
+            fingerprint,
+            source,
+        } => (path, from_cache, fingerprint, source),
         ScriptResolution::NeedsAdoption { from_tag, to_tag } => {
             let _ = push_log(
                 &state,
@@ -872,10 +1587,12 @@ async fn run_activation(
             );
             res.pin_from = Some(from_tag);
             res.pin_to = Some(to_tag);
+            clear_current(&state)?;
             return Ok(res);
         }
         ScriptResolution::NoConnection(msg) => {
             let _ = push_log(&state, &format!("[ERROR] {}", msg));
+            clear_current(&state)?;
             return Ok(outcome(
                 OutcomeKind::NoConnection,
                 "لا يوجد اتصال",
@@ -884,10 +1601,12 @@ async fn run_activation(
         }
         ScriptResolution::Integrity(msg) => {
             let _ = push_log(&state, &format!("[ERROR] {}", msg));
+            clear_current(&state)?;
             return Ok(outcome(OutcomeKind::Failed, "تحقق السلامة ❌", msg));
         }
         ScriptResolution::Io(msg) => {
             let _ = push_log(&state, &format!("[ERROR] {}", msg));
+            clear_current(&state)?;
             return Ok(outcome(
                 OutcomeKind::Failed,
                 "خطأ في التخزين ❌",
@@ -898,13 +1617,56 @@ async fn run_activation(
     let _ = push_log(
         &state,
         &format!(
-            "[INFO] سكربت التفعيل: {} (SHA-256: {}...)",
+            "[INFO] سكربت التفعيل: {} (SHA-256: {}...، مصدر التحقق: {})",
             if from_cache { "من الكاش" } else { "تم تنزيله" },
-            &MAS_EXPECTED_SHA256[..8]
+            fingerprint.get(..8).unwrap_or(&fingerprint),
+            source.label()
         ),
     );
 
-    let before = collect_products().await.0;
+    // الإلغاء يصل أثناء نافذة التجهيز: ensure انتهى والقياس القبلي لم يبدأ بعد
+    if cancel_flag.load(Ordering::SeqCst) {
+        clear_current(&state)?;
+        let _ = push_log(&state, "[CANCELLED] أُلغيت العملية قبل التنفيذ");
+        return Ok(outcome(
+            OutcomeKind::Cancelled,
+            "أُلغي",
+            "تم إلغاء العملية".to_string(),
+        ));
+    }
+
+    let (before, _, pre_error) = collect_products().await;
+
+    // دفاع في العمق ضد TOCTOU (تحقق-ثم-تنفيذ): بعد نجاح ensure وقبل بناء أمر cmd مباشرة
+    // يُعاد قراءة بايتات mas_path وتُحسب بصمتها وتُقارن بالبصمة التي أعادتها ensure —
+    // أي تغيير للمحتوى المخزن بين التحقق والتنفيذ يوقف العملية (مع ACL المحصّن يصبح
+    // صنف المهاجم الكاتب معدوماً؛ هذا حزام إضافي).
+    match std::fs::read(&mas_path) {
+        Ok(bytes) => {
+            let now_hash = sha256_hex(&bytes);
+            if !now_hash.eq_ignore_ascii_case(&fingerprint) {
+                let _ = push_log(
+                    &state,
+                    &format!(
+                        "[ERROR] تغير المحتوى المخزن بعد التحقق — لم يُنفذ أي شيء (المعتمد {} → الفعلي {})",
+                        fingerprint, now_hash
+                    ),
+                );
+                clear_current(&state)?;
+                return Ok(outcome(
+                    OutcomeKind::Failed,
+                    "تحقق السلامة ❌",
+                    "تغير المحتوى المخزن بعد التحقق — لم يُنفذ أي شيء".to_string(),
+                ));
+            }
+        }
+        Err(e) => {
+            let msg = format!("تعذر إعادة قراءة المحتوى المخزن قبل التنفيذ: {}", e);
+            let _ = push_log(&state, &format!("[ERROR] {}", msg));
+            clear_current(&state)?;
+            return Ok(outcome(OutcomeKind::Failed, "تحقق السلامة ❌", msg));
+        }
+    }
 
     // تنفيذ السكربت المحلي المعتمد عبر cmd — بدون أي تحميل حي أو ScriptBlock
     // raw_arg يمرر سطر الأوامر حرفيًا (cmd لا يفهم تهريب الشرطة المائلة للتنصيص)
@@ -920,25 +1682,31 @@ async fn run_activation(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("تعذر تشغيل PowerShell: {}", e))?;
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            clear_current(&state)?;
+            return Err(format!("تعذر تشغيل PowerShell: {}", e));
+        }
+    };
     let pid = child.id();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
 
+    // تسجيل pid داخل كتلة القفل نفسها مع فحص علم الإلغاء: لا نافذة سباق يكون فيها
+    // العلم مضبوطاً والطفل حياً دون أن يُقتل — إما cancel_operation رأى pid (فيقتل)،
+    // وإما نرى العلم هنا بعد التسجيل (فنقتل داخل القفل قبل إطلاقه)
     {
         let mut current = state
             .current
             .lock()
             .map_err(|_| "تعذر الوصول إلى حالة العمليات".to_string())?;
-        let op = RunningOp {
-            id: NEXT_OP_ID.fetch_add(1, Ordering::SeqCst),
-            kind: kind.clone(),
-            pid,
-            cancel: cancel_flag.clone(),
-        };
-        let _ = push_log(&state, &format!("[INFO] العملية #{}: {}", op.id, op.kind));
-        *current = Some(op);
+        if let Some(op) = current.as_mut() {
+            op.pid = pid;
+        }
+        if cancel_flag.load(Ordering::SeqCst) {
+            if let Some(pid) = pid {
+                kill_process_tree(pid);
+            }
+        }
     }
 
     let child_task = tokio::spawn(async move { child.wait_with_output().await });
@@ -970,8 +1738,10 @@ async fn run_activation(
     let stdout = String::from_utf8_lossy(&out).into_owned();
     let stderr = String::from_utf8_lossy(&err).into_owned();
     let mut tail: String = format!("{}\n{}", stdout, stderr).trim().to_string();
-    if tail.len() > 1500 {
-        tail = tail.chars().skip(tail.chars().count() - 1500).collect();
+    // [11] اقتطاع ذيل آمن للمحارف متعددة البايتات: الشرط على عدد المحارف لا البايتات،
+    // والاقتطاع يأخذ آخر 1500 محرفاً بلا طرح usize قد ينفلت (chars().count() < N مع len > N)
+    if tail.chars().count() > 1500 {
+        tail = tail.chars().rev().take(1500).collect::<String>().chars().rev().collect();
     }
     let output_tail = if tail.is_empty() { None } else { Some(redact_keys(&tail)) };
 
@@ -1029,48 +1799,14 @@ async fn run_activation(
     let before_summary = best_summary(before.as_deref().unwrap_or(&[]));
     let after_summary = best_summary(after.as_deref().unwrap_or(&[]));
 
-    let mut result = match (&before_summary, &after_summary) {
-        (None, None) | (None, Some(_)) => {
-            let improved = before_summary.is_none() && after_summary.is_some();
-            if improved {
-                outcome(
-                    OutcomeKind::VerifiedChange,
-                    "تم التحقق من التغيير ✅",
-                    format!("{} — تحققت العملية من تحسن حالة الترخيص", label),
-                )
-            } else {
-                outcome(
-                    OutcomeKind::Unverified,
-                    "تعذر التحقق ❓",
-                    "تعذر التحقق من حالة الترخيص بعد العملية".to_string(),
-                )
-            }
+    let mut result = {
+        let (kind, lbl, msg) =
+            classify_outcome(&kind, before_summary, after_summary, pre_error.as_deref());
+        let mut o = outcome(kind, &lbl, msg);
+        if matches!(kind, OutcomeKind::VerifiedChange | OutcomeKind::NoChange) {
+            o.message = format!("{} — {}", label, o.message);
         }
-        (Some(b), Some(a)) => {
-            if a.1 < b.1 {
-                outcome(
-                    OutcomeKind::VerifiedChange,
-                    "تم التحقق من التغيير ✅",
-                    format!("{} — تحسنت حالة الترخيص", label),
-                )
-            } else {
-                outcome(
-                    OutcomeKind::NoChange,
-                    "لم يتغير الوضع ⚠️",
-                    format!(
-                        "{} — لم تتغير حالة الترخيص ({} → {})",
-                        label,
-                        LicenseState::from_status(b.0).label(None),
-                        LicenseState::from_status(a.0).label(None)
-                    ),
-                )
-            }
-        }
-        (Some(_), None) => outcome(
-            OutcomeKind::Unverified,
-            "تعذر التحقق ❓",
-            "تعذر التحقق من حالة الترخيص بعد العملية".to_string(),
-        ),
+        o
     };
 
     if result.kind == OutcomeKind::NoChange && !exit_ok {
@@ -1101,8 +1837,75 @@ fn best_summary(products: &[RawProduct]) -> Option<(i32, u8)> {
     if let Some(o) = &office {
         all.push(o);
     }
-    all.sort_by_key(|s| LicenseState::priority(s.license_status));
-    all.first().map(|s| (s.license_status, LicenseState::priority(s.license_status)))
+    all.sort_by_key(|s| effective_priority(s.kind, s.license_status));
+    all.first()
+        .map(|s| (s.license_status, effective_priority(s.kind, s.license_status)))
+}
+
+/// تصنيف نتيجة العملية (نقية وقابلة للاختبار)
+/// فشل القياس القبلي (pre_error مع before=None) ليس «لا منتجات»: لا VerifiedChange بلا أساس قبلي.
+/// الرسائل تعاد بدون بادئة التسمية — يُضيفها المستدعي لنتائج التغيير/عدم التغيير.
+fn classify_outcome(
+    kind: &str,
+    before: Option<(i32, u8)>,
+    after: Option<(i32, u8)>,
+    pre_error: Option<&str>,
+) -> (OutcomeKind, String, String) {
+    if pre_error.is_some() && before.is_none() {
+        return (
+            OutcomeKind::Unverified,
+            "تعذر التحقق ❓".to_string(),
+            format!(
+                "تعذر قياس الحالة قبل التنفيذ{}",
+                pre_error.map_or_else(String::new, |e| format!(": {}", e))
+            ),
+        );
+    }
+    match (before, after) {
+        (None, None) | (None, Some(_)) => {
+            let improved = before.is_none() && after.is_some();
+            if improved {
+                (
+                    OutcomeKind::VerifiedChange,
+                    "تم التحقق من التغيير ✅".to_string(),
+                    "تحققت العملية من تحسن حالة الترخيص".to_string(),
+                )
+            } else {
+                (
+                    OutcomeKind::Unverified,
+                    "تعذر التحقق ❓".to_string(),
+                    "تعذر التحقق من حالة الترخيص بعد العملية".to_string(),
+                )
+            }
+        }
+        (Some(b), Some(a)) => {
+            if a.1 < b.1 {
+                (
+                    OutcomeKind::VerifiedChange,
+                    "تم التحقق من التغيير ✅".to_string(),
+                    "تحسنت حالة الترخيص".to_string(),
+                )
+            } else if let Some((lbl, msg)) = already_activated_message(kind, b.0, a.0) {
+                // مفعّل سابقاً ومفعّل الآن: لا حاجة للتفعيل (لا «لم يتغير الوضع» الموحي بمشكلة)
+                (OutcomeKind::NoChange, lbl, msg)
+            } else {
+                (
+                    OutcomeKind::NoChange,
+                    "لم يتغير الوضع ⚠️".to_string(),
+                    format!(
+                        "لم تتغير حالة الترخيص ({} → {})",
+                        LicenseState::from_status(b.0).label(None),
+                        LicenseState::from_status(a.0).label(None)
+                    ),
+                )
+            }
+        }
+        (Some(_), None) => (
+            OutcomeKind::Unverified,
+            "تعذر التحقق ❓".to_string(),
+            "تعذر التحقق من حالة الترخيص بعد العملية".to_string(),
+        ),
+    }
 }
 
 #[tauri::command]
@@ -1285,16 +2088,25 @@ fn is_key_token(t: &str) -> bool {
             .all(|p| p.len() == 5 && p.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
+/// فواصل تقسيم موسعة حتى يُمسك المفتاح الملاصق لعلامات مثل (key=XXXXX-...)
+/// أو المحاط بأقواس/تنصيص/نقطتين/معقوفتين — والأسطر الجديدة داخلة في is_whitespace
+fn is_key_separator(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            ',' | ';' | '.' | '=' | '"' | '\'' | '(' | ')' | ':' | '[' | ']'
+        )
+}
+
 fn contains_key_pattern(text: &str) -> bool {
-    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '.')
-        .any(is_key_token)
+    text.split(is_key_separator).any(is_key_token)
 }
 
 fn redact_keys(text: &str) -> String {
     if !contains_key_pattern(text) {
         return text.to_string();
     }
-    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '.')
+    text.split(is_key_separator)
         .map(|t| {
             if is_key_token(t) {
                 "[مفتاح محجوب]".to_string()
@@ -1484,8 +2296,20 @@ async fn run_dism() -> Result<(String, Option<String>), String> {
 }
 
 #[tauri::command]
-async fn edition_preflight() -> Result<EditionPreflightReport, String> {
+async fn edition_preflight(state: State<'_, AppState>) -> Result<EditionPreflightReport, String> {
     let snapshot = read_edition_snapshot().await;
+
+    // [7] تخزين اللقطة خادمياً كأساس «قبل» للتحقق اللاحق (تستبدل أي قيمة سابقة):
+    // verify_edition_change يعتمد عليها حصراً — قراءة «قبل» لحظية جديدة تسبق «بعد»
+    // بميكروثوانٍ فتجعل قبل==بعد دائماً وتُعطّل التحقق
+    if let Some((snap, _)) = &snapshot {
+        let mut guard = state
+            .edition_before
+            .lock()
+            .map_err(|_| "تعذر الوصول إلى حالة التطبيق".to_string())?;
+        *guard = Some(snap.clone());
+    }
+
     let dism_result = run_dism().await;
 
     let mut error: Option<StatusError> = match &dism_result {
@@ -1553,14 +2377,56 @@ async fn open_activation_settings() -> Result<String, String> {
     .map_err(|e| format!("خطأ في المعالجة: {}", e))?
 }
 
+/// تصنيف تحقق الإصدار على أساس اللقطة المخزنة خادمياً (نقية وقابلة للاختبار):
+/// غياب المخزنة أو فشل القراءة البعدية = VerificationFailed مهما بلغت الأخرى —
+/// لا تصنيف بلا أساس قبلي مخزّن.
+fn classify_verified_change(
+    stored_before: Option<&EditionSnapshot>,
+    after: Option<&EditionSnapshot>,
+) -> (EditionChangeStatus, bool) {
+    match (stored_before, after) {
+        (Some(b), Some(a)) => {
+            let restart_required =
+                pending_restart_detected(a.pending_file_rename, a.reboot_pending);
+            (classify_edition_change(Some(b), Some(a)), restart_required)
+        }
+        _ => (EditionChangeStatus::VerificationFailed, false),
+    }
+}
+
 #[tauri::command]
-async fn verify_edition_change(before: EditionSnapshot) -> Result<EditionChangeResult, String> {
+async fn verify_edition_change(
+    state: State<'_, AppState>,
+    before: EditionSnapshot,
+) -> Result<EditionChangeResult, String> {
+    // [7] لا يُوثق بحالة «قبل» القادمة من العميل ولا بقراءة لحظية جديدة: الأساس
+    // حصراً اللقطة المخزنة خادمياً عند edition_preflight — الحقل before الوارد
+    // مهمل تماماً (قراءة مزدوجة لحظية كانت تجعل قبل==بعد دائماً وتُعطّل التحقق)
+    let _ = &before;
+    let server_before = {
+        let guard = state
+            .edition_before
+            .lock()
+            .map_err(|_| "تعذر الوصول إلى حالة التطبيق".to_string())?;
+        guard.clone()
+    };
+    let Some(server_before) = server_before else {
+        return Ok(EditionChangeResult {
+            status: EditionChangeStatus::VerificationFailed,
+            before: None,
+            after: None,
+            restart_required: false,
+            checked_at: None,
+            safe_message: "لم تُحفظ لقطة قبل التغيير — أعد فحص الإصدار ثم حاول مجدداً".to_string(),
+        });
+    };
+
     let (after, checked_at) = match read_edition_snapshot().await {
         Some(v) => v,
         None => {
             return Ok(EditionChangeResult {
                 status: EditionChangeStatus::VerificationFailed,
-                before: Some(before),
+                before: Some(server_before),
                 after: None,
                 restart_required: false,
                 checked_at: None,
@@ -1569,13 +2435,11 @@ async fn verify_edition_change(before: EditionSnapshot) -> Result<EditionChangeR
         }
     };
 
-    let restart_required =
-        pending_restart_detected(after.pending_file_rename, after.reboot_pending);
-    let status = classify_edition_change(Some(&before), Some(&after));
+    let (status, restart_required) = classify_verified_change(Some(&server_before), Some(&after));
 
     Ok(EditionChangeResult {
         status,
-        before: Some(before),
+        before: Some(server_before),
         after: Some(after),
         restart_required,
         checked_at,
@@ -1768,19 +2632,50 @@ async fn change_edition(
         return Err("إصدارات التقييم لا تدعم التغيير المباشر".to_string());
     }
 
-    {
-        let current = state
+    // حجز خانة العملية فوراً داخل كتلة القفل نفسها (قبل أي await) — إصلاح TOCTOU
+    let cancel_flag = {
+        let mut current = state
             .current
             .lock()
             .map_err(|_| "تعذر الوصول إلى حالة العمليات".to_string())?;
         if current.is_some() {
             return Err("هناك عملية أخرى قيد التنفيذ".to_string());
         }
-    }
+        let flag = Arc::new(AtomicBool::new(false));
+        let op = RunningOp {
+            id: NEXT_OP_ID.fetch_add(1, Ordering::SeqCst),
+            kind: "edition_change".to_string(),
+            pid: None,
+            cancel: flag.clone(),
+        };
+        let _ = push_log(&state, &format!("[INFO] العملية #{}: {}", op.id, op.kind));
+        *current = Some(op);
+        flag
+    };
 
     let _ = push_log(&state, &format!("[INFO] تغيير الإصدار إلى {} ...", t));
 
-    let key_info = fetch_edition_key(t).await?;
+    // [2] لا يُوثق بحالة «قبل» القادمة من العميل: تُقرأ لقطة النظام خادمياً هنا
+    // (قبل أي قرار يعتمد على before). الحقل before الوارد يبقى احتياطاً أخيراً
+    // موثقاً فقط — تصنيف النتيجة قبل/بعد واختيار طريقة التغيير يبنيان على بيانات
+    // الخادم حصراً. (تُقرأ اللقطة بعد حجز خانة العملية حفاظاً على ثابت TOCTOU
+    // الموثق أعلاه: الحجز قبل أي await.)
+    let _ = &before;
+    let snap_before = match read_edition_snapshot().await {
+        Some((s, _)) => s,
+        None => {
+            clear_current(&state)?;
+            return Err("تعذر قراءة حالة النظام قبل التغيير".to_string());
+        }
+    };
+
+    let key_info = match fetch_edition_key(t).await {
+        Ok(k) => k,
+        Err(e) => {
+            clear_current(&state)?;
+            return Err(e);
+        }
+    };
     if !key_info.key_found || key_info.key.is_empty() {
         let detail = if key_info.error.is_empty() {
             "بدون تفاصيل".to_string()
@@ -1791,9 +2686,10 @@ async fn change_edition(
             &state,
             &format!("[ERROR] تعذر استرجاع مفتاح الإصدار العام من النظام ({})", detail),
         );
+        clear_current(&state)?;
         return Ok(EditionChangeResult {
             status: EditionChangeStatus::VerificationFailed,
-            before: Some(before),
+            before: Some(snap_before.clone()),
             after: None,
             restart_required: false,
             checked_at: None,
@@ -1802,16 +2698,17 @@ async fn change_edition(
     }
 
     let method = select_change_method(
-        &before.edition_id,
+        &snap_before.edition_id,
         key_info.server_image,
         key_info.has_tokens,
         key_info.build,
     );
     if method == ChangeMethod::Unsupported {
         let _ = push_log(&state, "[ERROR] مسار تغيير الإصدار غير مدعوم على هذا النظام");
+        clear_current(&state)?;
         return Ok(EditionChangeResult {
             status: EditionChangeStatus::UnsupportedPath,
-            before: Some(before),
+            before: Some(snap_before.clone()),
             after: None,
             restart_required: false,
             checked_at: None,
@@ -1840,25 +2737,31 @@ async fn change_edition(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("تعذر تشغيل أمر تغيير الإصدار: {}", e))?;
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            clear_current(&state)?;
+            return Err(format!("تعذر تشغيل أمر تغيير الإصدار: {}", e));
+        }
+    };
     let pid = child.id();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
 
+    // تسجيل pid داخل كتلة القفل نفسها مع فحص علم الإلغاء: لا نافذة سباق يكون فيها
+    // العلم مضبوطاً والطفل حياً دون أن يُقتل — إما cancel_operation رأى pid (فيقتل)،
+    // وإما نرى العلم هنا بعد التسجيل (فنقتل داخل القفل قبل إطلاقه)
     {
         let mut current = state
             .current
             .lock()
             .map_err(|_| "تعذر الوصول إلى حالة العمليات".to_string())?;
-        let op = RunningOp {
-            id: NEXT_OP_ID.fetch_add(1, Ordering::SeqCst),
-            kind: "edition_change".to_string(),
-            pid,
-            cancel: cancel_flag.clone(),
-        };
-        let _ = push_log(&state, &format!("[INFO] العملية #{}: {}", op.id, op.kind));
-        *current = Some(op);
+        if let Some(op) = current.as_mut() {
+            op.pid = pid;
+        }
+        if cancel_flag.load(Ordering::SeqCst) {
+            if let Some(pid) = pid {
+                kill_process_tree(pid);
+            }
+        }
     }
 
     let child_task = tokio::spawn(async move { child.wait_with_output().await });
@@ -1890,8 +2793,9 @@ async fn change_edition(
     }
 
     let mut tail: String = format!("{}\n{}", out, err).trim().to_string();
-    if tail.len() > 800 {
-        tail = tail.chars().skip(tail.chars().count() - 800).collect();
+    // [11] اقتطاع ذيل آمن للمحارف متعددة البايتات (نفس قاعدة موضع الـ1500 أعلاه)
+    if tail.chars().count() > 800 {
+        tail = tail.chars().rev().take(800).collect::<String>().chars().rev().collect();
     }
     if !tail.is_empty() {
         let _ = push_log(&state, &format!("[OUT] {}", redact_keys(&tail)));
@@ -1911,7 +2815,7 @@ async fn change_edition(
     } else if !exec_ok {
         EditionChangeStatus::VerificationFailed
     } else {
-        classify_edition_change(Some(&before), after_snapshot.as_ref())
+        classify_edition_change(Some(&snap_before), after_snapshot.as_ref())
     };
 
     let restart_required = after_snapshot
@@ -1927,9 +2831,14 @@ async fn change_edition(
 
     let _ = push_log(&state, &format!("[RESULT] {:?} — {}", status, safe_message));
 
+    // [7/13] لا نمسح اللقطة المخزنة هنا عمداً: بعد التغيير المدفوع من التطبيق يضغط
+    // المستخدم «تحقق الآن» فيستدعي verify_edition_change التي تقارن اللقطة المخزنة
+    // (ما قبل التغيير) بالحالة الراهنة — المسح هنا كان يعطّل هذا التحقق.
+    // اللقطة تُستبدل تلقائياً في كل edition_preflight جديد فتبقى حديثة.
+
     Ok(EditionChangeResult {
         status,
-        before: Some(before),
+        before: Some(snap_before),
         after: after_snapshot,
         restart_required,
         checked_at,
@@ -1972,6 +2881,7 @@ async fn check_update() -> Result<UpdateInfo, String> {
         let response = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .user_agent("MAS-Activator")
+                .timeout_global(Some(Duration::from_secs(60)))
                 .build(),
         )
         .get("https://api.github.com/repos/SMSMy/mas-activator-Disktop/releases/latest")
@@ -2067,24 +2977,74 @@ fn resolve_download_path(filename: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// قائمة مضيفات مسموحة لتنزيل التحديث (تُستعمل قبلياً على الرابط الأصلي الوارد من
+/// واجهة التحديث وبعدياً على رابط الاستجابة النهائي بعد أي تحويلات):
+/// يُقبل حصراً github.com أو ما ينتهي بـ.github.com أو .githubusercontent.com
+/// (تشملها objects.githubusercontent.com وrelease-assets.githubusercontent.com)،
+/// ويُرفض أي مضيف يحمل محارف خارج [a-z0-9.-] — يحبط حيل @ و? و# ومنافذ : —
+/// والمضيف الفارغ مرفوض.
+fn update_host_allowed(url: &str) -> bool {
+    let rest = match url.strip_prefix("https://") {
+        Some(r) => r,
+        None => return false,
+    };
+    let host = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    // رفض صريح لأي محرف خارج [a-z0-9.-]: @ و? و# و: (المنفذ) لا مكان لها في مضيف صالح
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+    {
+        return false;
+    }
+    host == "github.com"
+        || host.ends_with(".github.com")
+        || host.ends_with(".githubusercontent.com")
+}
+
 #[tauri::command]
 async fn download_update(url: String, filename: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
+        // [4] فحص مضيف الرابط قبل أي نداء شبكي: أي مضيف خارج قائمة GitHub = رفض
+        if !update_host_allowed(&url) {
+            return Err("مضيف التحميل غير مسموح".to_string());
+        }
         let file_path = resolve_download_path(&filename)?;
 
         let response = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .user_agent("MAS-Activator")
+                .timeout_global(Some(Duration::from_secs(180)))
                 .build(),
         )
         .get(&url)
         .call()
         .map_err(|e| format!("تعذر تحميل الملف: {}", e))?;
 
-        let bytes = response
+        // [10] فحص مضيف رابط الاستجابة النهائي بعد أي تحويلات (ureq يتبع إعادة
+        // التوجيه تلقائياً): الفحص القبلي على الرابط الأصلي يبقى كما هو، ويُعاد
+        // الفحص هنا على وجه التحميل النهائي قبل قراءة أي بايت من الجسم —
+        // مخالفة = رفض صريح
+        let final_url = ureq::ResponseExt::get_uri(&response).to_string();
+        if !update_host_allowed(&final_url) {
+            return Err("وجه التحميل النهائي غير مسموح".to_string());
+        }
+
+        // قراءة محدودة: حتى 300MB ثم تحقق من الحجم (لا تكسر تنزيل المثبتات العادية)
+        let mut bytes = Vec::new();
+        response
             .into_body()
-            .read_to_vec()
+            .into_reader()
+            .take(MAX_UPDATE_DOWNLOAD_BYTES + 1)
+            .read_to_end(&mut bytes)
             .map_err(|e| format!("خطأ أثناء التحميل: {}", e))?;
+        if bytes.len() as u64 > MAX_UPDATE_DOWNLOAD_BYTES {
+            return Err(
+                "حجم ملف التحديث يتجاوز الحد المسموح (300 ميجابايت) — لم يُحفظ أي شيء".to_string(),
+            );
+        }
 
         std::fs::write(&file_path, &bytes)
             .map_err(|e| format!("تعذر حفظ الملف: {}", e))?;
@@ -2110,6 +3070,7 @@ pub fn run() {
     let app_state = AppState {
         logs: Arc::new(Mutex::new(Vec::new())),
         current: Arc::new(Mutex::new(None)),
+        edition_before: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
@@ -2288,7 +3249,23 @@ mod tests {
     fn office_name_cleanup() {
         assert_eq!(
             office_clean_name("Office 16, Office16ProPlusR_Grace edition"),
-            "Office16ProPlusR_Grace edition"
+            "Office 2016 Professional Plus"
+        );
+        assert_eq!(
+            office_clean_name("Office19HomeStudent2019R_Retail edition"),
+            "Office 2019 Home & Student"
+        );
+        assert_eq!(
+            office_clean_name("Office21ProPlus2021VL_MAK edition"),
+            "Office 2021 Professional Plus (LTSC)"
+        );
+        assert_eq!(
+            office_clean_name("Office16MondoR_Retail edition"),
+            "Office 365"
+        );
+        assert_eq!(
+            office_clean_name("Project19Pro2019VL_MAK edition"),
+            "Project Professional 2019 (LTSC)"
         );
         assert_eq!(office_clean_name("  Office 19, foo  "), "foo");
         assert_eq!(office_clean_name("Project 16, ProPlus"), "Project 16");
@@ -2312,7 +3289,10 @@ mod tests {
         })
         .unwrap();
         assert!(!best.name.to_uppercase().contains("ONENOTE"));
-        assert_eq!(best.state, LicenseState::Notification);
+        // الحالة 5 لأوفيس (إشعار ترخيص) هي ما تُبقيه Ohook على المنتج المفعّل فعلاً
+        // فتُعرض مفعّلة — لا Notification
+        assert_eq!(best.state, LicenseState::Activated);
+        assert_eq!(best.label, "مفعل ✅");
     }
 
     #[test]
@@ -2373,6 +3353,30 @@ mod tests {
         assert!(result.is_ok());
         let path = result.unwrap();
         assert_eq!(path.file_name().unwrap().to_string_lossy(), "MAS-Activator-2.2.0.exe");
+    }
+
+    #[test]
+    fn update_host_allowlist_rejects_foreign_hosts() {
+        // [14] مضيفات خارجة عن عائلة GitHub = رفض، والمضيف الفارغ مرفوض
+        assert!(!update_host_allowed("https://evil.com/x"));
+        assert!(!update_host_allowed("https://github.com.evil.com/x"));
+        assert!(!update_host_allowed("https://evilgithub.com/x"));
+        // حيل @ والمنفذ : تُحبط بفحص المحارف — لا تُمرَّر كأنها مضيفات صالحة
+        assert!(!update_host_allowed("https://github.com:444@evil.com/x"));
+        assert!(!update_host_allowed(""));
+        // بروتوكول غير https ومضيف بمنفذ = رفض
+        assert!(!update_host_allowed("http://github.com/x"));
+        assert!(!update_host_allowed("https://github.com:443/x"));
+        assert!(!update_host_allowed("https://github.com.evil.com@github.com/x"));
+    }
+
+    #[test]
+    fn update_host_allowlist_accepts_github_family() {
+        assert!(update_host_allowed("https://github.com/x"));
+        assert!(update_host_allowed("https://api.github.com/x"));
+        assert!(update_host_allowed("https://objects.githubusercontent.com/x"));
+        assert!(update_host_allowed("https://release-assets.githubusercontent.com/x"));
+        assert!(update_host_allowed("https://raw.githubusercontent.com/x"));
     }
 
     fn snap(
@@ -2496,6 +3500,24 @@ The operation completed successfully.
     }
 
     #[test]
+    fn verify_without_stored_before_fails_verification() {
+        // [7] غياب اللقطة المخزنة خادمياً ⇒ VerificationFailed مهما كانت «بعد» —
+        // لا يُعاد قراءة «قبل» لحظية (كانت تجعل قبل==بعد دائماً وتُعطّل التحقق)
+        let after = snap("Professional", Some(LicenseState::Activated), false, false);
+        let (status, restart) = classify_verified_change(None, Some(&after));
+        assert_eq!(status, EditionChangeStatus::VerificationFailed);
+        assert!(!restart);
+        // لقطة مخزنة + قراءة بعدية صالحة = التصنيف الطبيعي
+        let before = snap("Core", Some(LicenseState::Activated), false, false);
+        let (status, restart) = classify_verified_change(Some(&before), Some(&after));
+        assert_eq!(status, EditionChangeStatus::EditionChangedAndActivated);
+        assert!(!restart);
+        // قراءة بعدية فاشلة = VerificationFailed أيضاً
+        let (status, _) = classify_verified_change(Some(&before), None);
+        assert_eq!(status, EditionChangeStatus::VerificationFailed);
+    }
+
+    #[test]
     fn key_pattern_detection() {
         assert!(contains_key_pattern("XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"));
         assert!(contains_key_pattern("المفتاح: ABCDE-FGHIJ-KLMNO-PQRST-UVWXY"));
@@ -2515,6 +3537,49 @@ The operation completed successfully.
     }
 
     #[test]
+    fn key_redaction_catches_key_adjacent_to_equals() {
+        // [10] المفتاح الملاصق لعلامة = يُقسم على '=' ويُحجب — لا يبقى النمط الخام
+        let input = "key=ABCDE-FGHIJ-KLMNO-PQRST-UVWXY";
+        let redacted = redact_keys(input);
+        assert!(!contains_key_pattern(&redacted));
+        assert!(
+            !redacted.contains("ABCDE-FGHIJ-KLMNO-PQRST-UVWXY"),
+            "النمط الخام بقي ظاهراً في: {}",
+            redacted
+        );
+        // علامات أخرى ملاصقة أيضاً
+        assert!(!contains_key_pattern(
+            &redact_keys("\"ABCDE-FGHIJ-KLMNO-PQRST-UVWXY\"")
+        ));
+        assert!(!contains_key_pattern(
+            &redact_keys("(ABCDE-FGHIJ-KLMNO-PQRST-UVWXY)")
+        ));
+        assert!(!contains_key_pattern(
+            &redact_keys("k:ABCDE-FGHIJ-KLMNO-PQRST-UVWXY")
+        ));
+        assert!(!contains_key_pattern(
+            &redact_keys("[ABCDE-FGHIJ-KLMNO-PQRST-UVWXY]")
+        ));
+    }
+
+    #[test]
+    fn probe_writable_fails_on_missing_directory() {
+        // [12] مسبار على مسار غير موجود = فشل (لا يُنشئ المجلد ولا ينجح زوراً)
+        let dir = std::env::temp_dir().join(format!(
+            "mas_probe_missing_{}_{}",
+            std::process::id(),
+            NEXT_OP_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !probe_writable(&dir),
+            "المسبار يجب أن يفشل على مسار غير موجود"
+        );
+        // لا تُترك أي بقايا
+        assert!(!dir.exists());
+    }
+
+    #[test]
     fn sha256_hex_known_vector() {
         // SHA-256("abc") — متجه معياري
         assert_eq!(
@@ -2527,19 +3592,69 @@ The operation completed successfully.
     fn pinned_hash_format_is_valid() {
         assert_eq!(MAS_EXPECTED_SHA256.len(), 64);
         assert!(MAS_EXPECTED_SHA256.chars().all(|c| c.is_ascii_hexdigit()));
-        assert!(hash_matches_expected(&[0u8; 10]) == false);
+        assert!(!hash_matches_expected(&[0u8; 10]));
     }
 
     #[test]
-    fn cache_path_inside_local_app_data() {
-        let path = resolve_cache_path().unwrap();
-        assert_eq!(
-            path.file_name().unwrap().to_string_lossy(),
-            mas_script_name().as_str()
-        );
-        let parent = path.parent().unwrap();
-        assert!(parent.ends_with("cache"));
-        assert!(parent.to_string_lossy().contains("MAS Activator"));
+    fn cache_path_inside_program_data() {
+        #[cfg(target_os = "windows")]
+        {
+            // على ويندوز: النجاح يعني المسار تحت ProgramData حصراً (لا احتياط)،
+            // والفشل في بيئات الاختبار العادية (إن حدث — مثلاً عند عدم توفر صلاحية
+            // التحصين) يُقبل فقط بوصفه Err صريحاً يذكر ProgramData — لا نجاح
+            // احتياطي إلى LOCALAPPDATA إطلاقاً.
+            match resolve_cache_path() {
+                Ok(path) => {
+                    assert_eq!(
+                        path.file_name().unwrap().to_string_lossy(),
+                        mas_script_name().as_str()
+                    );
+                    let parent = path.parent().unwrap();
+                    assert!(parent.ends_with("cache"));
+                    assert!(parent.to_string_lossy().contains("MAS Activator"));
+                    let program_data_expected = std::env::var("PROGRAMDATA")
+                        .map(|p| PathBuf::from(p).join("MAS Activator").join("cache"))
+                        .ok();
+                    assert_eq!(
+                        program_data_expected,
+                        Some(parent.to_path_buf()),
+                        "على ويندوز يجب أن يكون مسار الكاش تحت ProgramData حصراً: {}",
+                        parent.display()
+                    );
+                }
+                Err(e) => {
+                    assert!(
+                        e.contains("ProgramData"),
+                        "فشل تجهيز الكاش على ويندوز يجب أن يكون Err يذكر ProgramData: {}",
+                        e
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // على غير ويندوز يُحفظ السلوك السابق: ProgramData أو الاحتياط LOCALAPPDATA
+            let path = resolve_cache_path().unwrap();
+            assert_eq!(
+                path.file_name().unwrap().to_string_lossy(),
+                mas_script_name().as_str()
+            );
+            let parent = path.parent().unwrap();
+            assert!(parent.ends_with("cache"));
+            assert!(parent.to_string_lossy().contains("MAS Activator"));
+            let program_data_expected = std::env::var("PROGRAMDATA")
+                .map(|p| PathBuf::from(p).join("MAS Activator").join("cache"))
+                .ok();
+            let local_expected = std::env::var("LOCALAPPDATA")
+                .map(|p| PathBuf::from(p).join("MAS Activator").join("cache"))
+                .ok();
+            assert!(
+                program_data_expected == Some(parent.to_path_buf())
+                    || local_expected == Some(parent.to_path_buf()),
+                "مسار الكاش ({}) يجب أن يكون إما تحت ProgramData أو LOCALAPPDATA",
+                parent.display()
+            );
+        }
     }
 
     #[test]
@@ -2594,6 +3709,49 @@ The operation completed successfully.
     }
 
     #[test]
+    fn corrupt_pin_meta_is_distinct_from_missing() {
+        // فصل المرساة التالفة عن المفقودة: تالفة = Err برسالة «تالف»، غائبة = Ok(None)
+        let dir = std::env::temp_dir().join(format!(
+            "mas_pin_meta_{}_{}",
+            std::process::id(),
+            NEXT_OP_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // ملف غائب = Ok(None): «لا اعتماد مسجل» — تمييز أول
+        let missing = dir.join("missing.json");
+        assert!(
+            matches!(load_pin_meta_from(&missing), Ok(None)),
+            "الملف الغائب يجب أن يُعاد Ok(None)"
+        );
+
+        // ملف JSON تالف = Err برسالة «تالف»: تمييز ثانٍ مختلف عن الغياب — لا يُبتلع كـ None
+        let corrupt = dir.join("corrupt.json");
+        std::fs::write(&corrupt, "{not-valid-json").unwrap();
+        match load_pin_meta_from(&corrupt) {
+            Err(msg) => assert!(
+                msg.contains("تالف"),
+                "رسالة التمييز («تالف») مفقودة في: {}",
+                msg
+            ),
+            Ok(v) => panic!("الملف التالف يجب أن يُعاد Err وليس {:?}", v),
+        }
+
+        // ملف سليم = Ok(Some): شاهد على أن المسار الثالث يعمل بلا خلط
+        let good = dir.join("good.json");
+        std::fs::write(
+            &good,
+            r#"{"version_tag":"3.13","sha256":"ABC","adopted_at":1}"#,
+        )
+        .unwrap();
+        let loaded = load_pin_meta_from(&good).expect("المرساة السليمة يجب أن تُقرأ");
+        assert!(loaded.is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn edition_status_messages_all_present() {
         let statuses = [
             EditionChangeStatus::SettingsOpened,
@@ -2637,5 +3795,213 @@ The operation completed successfully.
             select_change_method("EnterpriseEval", false, true, 26100),
             ChangeMethod::Unsupported
         );
+    }
+
+    #[test]
+    fn parse_tag_rejects_non_numeric_segments() {
+        assert_eq!(parse_tag("3.12"), Some(vec![3, 12]));
+        assert_eq!(parse_tag("v3.12.1"), Some(vec![3, 12, 1]));
+        // لواحق غير رقمية (pre-release) = فشل تحليل صريح
+        assert_eq!(parse_tag("3.13-beta"), None);
+        assert_eq!(parse_tag("3.13.alpha"), None);
+        assert_eq!(parse_tag("3.12rc1"), None);
+        assert_eq!(parse_tag(""), None);
+        assert_eq!(parse_tag("abc"), None);
+        assert_eq!(parse_tag("3."), None);
+        assert_eq!(parse_tag(".3"), None);
+    }
+
+    #[test]
+    fn tag_is_newer_rejects_non_numeric_suffixes() {
+        // الوسم غير الرقمي لا يُعامل «أحدث» مهما كان حجمه الحرفي
+        assert!(!tag_is_newer("3.13-beta", "3.12"));
+        assert!(!tag_is_newer("3.13-beta", "3.13"));
+        assert!(!tag_is_newer("4.0-pre", "3.12"));
+        assert!(!tag_is_newer("3.12", "3.13-beta"));
+        // المقارنات الرقمية الصرفة تبقى كما هي
+        assert!(tag_is_newer("3.13", "3.12"));
+        assert!(!tag_is_newer("3.12", "3.13"));
+    }
+
+    #[test]
+    fn adoption_rejects_non_newer_tag() {
+        let base = MAS_PINNED_TAG;
+        assert!(adoption_allowed("3.13", base));
+        assert!(adoption_allowed("3.12.1", base));
+        assert!(adoption_allowed("4.0", base));
+        assert!(!adoption_allowed("3.12", base));
+        assert!(!adoption_allowed("3.11", base));
+        assert!(!adoption_allowed("3.13-beta", base));
+        // الأساس المخصص: المقارنة ضد المرساة الحالية وليس ضد الثابت المضمن
+        assert!(!adoption_allowed("3.13", "3.13"));
+        assert!(adoption_allowed("3.14", "3.13"));
+        assert!(!adoption_allowed("3.12", "3.13"));
+    }
+
+    #[test]
+    fn adoption_baseline_falls_back_to_pinned_tag() {
+        // بلا مرساة: الأساس = الثابت المضمن
+        assert_eq!(adoption_baseline(None), MAS_PINNED_TAG.to_string());
+        // مرساة بوسم رقمي صالح: الأساس = وسم المرساة
+        let meta = PinMeta {
+            version_tag: "3.13".to_string(),
+            sha256: "ABC".to_string(),
+            adopted_at: 1,
+        };
+        assert_eq!(adoption_baseline(Some(&meta)), "3.13");
+        // مرساة بوسم غير صالح (غير رقمي): الأساس يرتد إلى الثابت المضمن
+        let bad = PinMeta {
+            version_tag: "3.13-beta".to_string(),
+            sha256: "ABC".to_string(),
+            adopted_at: 1,
+        };
+        assert_eq!(adoption_baseline(Some(&bad)), MAS_PINNED_TAG.to_string());
+    }
+
+    #[test]
+    fn downloaded_content_classified_against_recorded_or_embedded_fingerprint() {
+        // [12] أي تطابق — البصمة المضمنة أو بصمة المرساة المسجلة — يقبل المحتوى
+        // بمصدر البصمة التي طابقت (Embedded أو Adopted)
+        let bytes = b"fake-mas-script-content-for-test";
+        let meta = PinMeta {
+            version_tag: "3.13".to_string(),
+            sha256: sha256_hex(bytes),
+            adopted_at: 1,
+        };
+        let hash = sha256_hex(bytes);
+        // لا يطابق البصمة المضمنة — يطابق المرساة المسجلة فقط (حالة S2)
+        assert!(!hash.eq_ignore_ascii_case(MAS_EXPECTED_SHA256));
+        assert_eq!(
+            classify_content(&hash, Some(&meta)),
+            Some(VerifySource::Adopted)
+        );
+        // مطابقة البصمة المضمنة = Embedded (من الكاش أو من تنزيل طازج)
+        assert_eq!(
+            classify_content(MAS_EXPECTED_SHA256, Some(&meta)),
+            Some(VerifySource::Embedded)
+        );
+        // محتوى لا يطابق أي بصمة = رفض
+        let other = sha256_hex(b"other-content");
+        assert_eq!(classify_content(&other, Some(&meta)), None);
+        assert_eq!(classify_content(&other, None), None);
+    }
+
+    #[test]
+    fn classify_outcome_distinguishes_failed_pre_measurement() {
+        // فشل القياس القبلي + نجاح بعدي: لا VerifiedChange بلا أساس قبلي
+        let (kind, _, msg) = classify_outcome(
+            "office",
+            None,
+            Some((1, 0)),
+            Some("انتهت مهلة فحص الترخيص"),
+        );
+        assert_eq!(kind, OutcomeKind::Unverified);
+        assert!(msg.contains("تعذر قياس الحالة قبل التنفيذ"));
+        // فشل القياس القبلي + لا قياس بعدي
+        let (kind, _, msg) = classify_outcome("office", None, None, Some("تعذر تشغيل PowerShell"));
+        assert_eq!(kind, OutcomeKind::Unverified);
+        assert!(msg.contains("تعذر قياس الحالة قبل التنفيذ"));
+        // قياس قبلي ناجح بلا منتجات + تحسن بعدي = VerifiedChange (السلوك السابق محفوظ)
+        let (kind, _, _) = classify_outcome("office", None, Some((1, 0)), None);
+        assert_eq!(kind, OutcomeKind::VerifiedChange);
+        // خطأ جزئي مع before=Some لا يمنع المقارنة الطبيعية
+        let (kind, _, _) = classify_outcome("office", Some((0, 6)), Some((1, 0)), Some("ملاحظة جزئية"));
+        assert_eq!(kind, OutcomeKind::VerifiedChange);
+        let (kind, _, _) = classify_outcome("office", Some((1, 0)), Some((1, 0)), Some("ملاحظة جزئية"));
+        assert_eq!(kind, OutcomeKind::NoChange);
+        // قياس بعدي فاشل = Unverified
+        let (kind, _, _) = classify_outcome("office", Some((1, 0)), None, None);
+        assert_eq!(kind, OutcomeKind::Unverified);
+    }
+
+    #[test]
+    fn already_activated_shows_no_need_message() {
+        // أوفيس مفعّل (حتى بحالة الإشعار 5 التي تُبقيها Ohook) قبل وبعد = لا حاجة للتفعيل
+        let (k, lbl, msg) = classify_outcome("office", Some((5, 5)), Some((5, 5)), None);
+        assert_eq!(k, OutcomeKind::NoChange);
+        assert_eq!(lbl, "لا حاجة للتفعيل ✅");
+        assert!(msg.contains("أوفيس مفعّل بالفعل ✅"));
+        // ويندوز مفعّل قبل وبعد
+        let (_, lbl2, msg2) = classify_outcome("windows", Some((1, 0)), Some((1, 0)), None);
+        assert_eq!(lbl2, "لا حاجة للتفعيل ✅");
+        assert!(msg2.contains("ويندوز مفعّل بالفعل ✅"));
+        // ويندوز بحالة الإشعار 5 لا يُعامل مفعلاً
+        let (_, lbl3, _) = classify_outcome("windows", Some((5, 5)), Some((5, 5)), None);
+        assert_eq!(lbl3, "لم يتغير الوضع ⚠️");
+        // حالة غير مفعّلة متساوية قبل وبعد = الرسالة الافتراضية
+        let (_, lbl4, _) = classify_outcome("office", Some((0, 6)), Some((0, 6)), None);
+        assert_eq!(lbl4, "لم يتغير الوضع ⚠️");
+        // حالة تغيرت (حتى لو مفعلة) = ليست «لا حاجة»
+        let (_, lbl5, _) = classify_outcome("office", Some((0, 6)), Some((1, 0)), None);
+        assert_eq!(lbl5, "تم التحقق من التغيير ✅");
+    }
+
+    #[test]
+    fn payload_validation_rejects_bad_content() {
+        // فارغة
+        assert!(validate_mas_payload(b"").is_err());
+        // استجابة HTML بحجم معقول (تُرفض بسبب العلامة وليس الحجم)
+        let mut html = String::from("<html><body>");
+        html.push_str(&"x".repeat(120 * 1024));
+        html.push_str("</body></html>");
+        assert!(validate_mas_payload(html.as_bytes()).is_err());
+        let mut doctype = String::from("<!DOCTYPE html><html>");
+        doctype.push_str(&"x".repeat(120 * 1024));
+        assert!(validate_mas_payload(doctype.as_bytes()).is_err());
+        // صغيرة جداً
+        let small = vec![b'A'; 99 * 1024];
+        assert!(validate_mas_payload(&small).is_err());
+        // كبيرة جداً (فوق سقف 5MB الجديد)
+        let huge = vec![b'A'; 5 * 1024 * 1024 + 1];
+        assert!(validate_mas_payload(&huge).is_err());
+        let six_mb = vec![b'A'; 6 * 1024 * 1024];
+        assert!(validate_mas_payload(&six_mb).is_err());
+        // محتوى ثنائي (NUL في أول 256 بايت)
+        let mut nul = vec![b'A'; 120 * 1024];
+        nul[10] = 0;
+        assert!(validate_mas_payload(&nul).is_err());
+        // نص سليم بحجم معقول = قبول
+        let good = vec![b'A'; 120 * 1024];
+        assert!(validate_mas_payload(&good).is_ok());
+        // 2MB مقبولة تحت السقف الجديد (هامش مستقبلي — الحجم الفعلي الحالي ~744KB)
+        let two_mb = vec![b'A'; 2 * 1024 * 1024];
+        assert!(validate_mas_payload(&two_mb).is_ok());
+    }
+
+    #[test]
+    fn legacy_migration_requires_matching_fingerprint_and_never_moves_meta() {
+        let new_dir = std::env::temp_dir().join(format!("mas_mig_new_{}", std::process::id()));
+        let legacy_dir =
+            std::env::temp_dir().join(format!("mas_mig_legacy_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&new_dir);
+        let _ = std::fs::remove_dir_all(&legacy_dir);
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+
+        // (ب) سكربت قديم ببصمة خاطئة: لا يُنسخ إلى الكاش الجديد
+        let bad_script = legacy_dir.join(mas_script_name());
+        std::fs::write(&bad_script, b"wrong-fingerprint-content").unwrap();
+        migrate_legacy_cache(&new_dir, &legacy_dir);
+        assert!(!new_dir.join(mas_script_name()).exists());
+
+        // (أ) مرساة الاعتماد القديمة لا تُهاجر أبداً (المستخدم يعيد الاعتماد عبر تدفق الموافقة)
+        let old_meta = legacy_dir.join("pin-meta.json");
+        std::fs::write(
+            &old_meta,
+            r#"{"version_tag":"3.13","sha256":"ABC","adopted_at":1}"#,
+        )
+        .unwrap();
+        migrate_legacy_cache(&new_dir, &legacy_dir);
+        assert!(!new_dir.join("pin-meta.json").exists());
+
+        // الكاش الجديد المستهدف بلا محتوى وارد: لا يُنشئ الهجرة ملفات من لا شيء
+        let entries: Vec<_> = std::fs::read_dir(&new_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(entries.is_empty(), "الكاش الجديد يجب أن يبقى فارغاً: {:?}", entries);
+
+        std::fs::remove_dir_all(&new_dir).ok();
+        std::fs::remove_dir_all(&legacy_dir).ok();
     }
 }

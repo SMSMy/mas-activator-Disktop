@@ -32,16 +32,13 @@ export function ConfirmDialog({
   isDark,
 }: ConfirmDialogProps) {
   return (
-    <Dialog open={open} onOpenChange={(v) => !loading && onOpenChange(v)}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         className={`rounded-xl max-w-md ${
           isDark
             ? "bg-gradient-to-br from-slate-900 to-slate-800 border border-cyan-500/30"
             : "bg-white border border-slate-200"
         }`}
-        onPointerDownOutside={(e) => {
-          if (loading) e.preventDefault();
-        }}
       >
         <DialogHeader>
           <DialogTitle

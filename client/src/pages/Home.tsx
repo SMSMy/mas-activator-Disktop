@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { Loader2, Zap, Monitor, FileText, CheckCircle2, Sun, Moon, PartyPopper, Ban, ArrowLeftRight, ShieldAlert, FileDown } from "lucide-react";
+import { Loader2, Zap, Monitor, FileText, CheckCircle2, Sun, Moon, PartyPopper, Ban, ArrowLeftRight, ShieldAlert, FileDown, X } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { TargetAndTransition } from "framer-motion";
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -13,6 +13,7 @@ import { LogViewer } from "@/components/ui/LogViewer";
 import { StatusDialog } from "@/components/ui/StatusDialog";
 import { EditionDialog } from "@/components/EditionDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import type { OperationOutcome, OpState, StatusReport } from "@/types";
 
 type ActivationAction = {
@@ -42,6 +43,8 @@ export default function Home() {
   const [protectionBlocked, setProtectionBlocked] = useState(false);
   const [pinAdoption, setPinAdoption] = useState<{ from: string; to: string } | null>(null);
   const [adopting, setAdopting] = useState(false);
+  const [lastAction, setLastAction] = useState<{ action: ActivationAction; buttonKey: string } | null>(null);
+  const [resultDialog, setResultDialog] = useState<{ variant: "success" | "warning" | "failure"; title: string; message: string } | null>(null);
   const buttonRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   useEffect(() => {
@@ -76,11 +79,11 @@ export default function Home() {
 
   const busy = opState === "running" || opState === "cancelling";
 
-  const handleActivation = async (action: ActivationAction, buttonKey: string) => {
+  const handleActivation = async (action: ActivationAction, buttonKey: string, keepLogs = false) => {
     if (busy) return;
     setOpState("running");
     setActiveAction(action.name);
-    setLogs([]);
+    if (!keepLogs) setLogs([]);
     setProtectionBlocked(false);
     addLog(`جاري تنفيذ: ${action.label}`);
 
@@ -98,29 +101,40 @@ export default function Home() {
         case "verified_change":
           toast.success(outcome.message);
           triggerCelebration(buttonKey);
-          await handleCheckStatus();
+          // بعد التفعيل يعرض السجل حالة المنتج المُفعَّل فقط (أوفيس مستقل عن ويندوز)
+          await handleCheckStatus(
+            action.kind === "windows" ? "windows" : action.kind === "office" ? "office" : null
+          );
+          setResultDialog({ variant: "success", title: outcome.label, message: outcome.message });
           break;
         case "no_change":
           toast.info(outcome.message);
+          setResultDialog({ variant: "warning", title: outcome.label, message: outcome.message });
           break;
         case "unverified":
           toast.warning(outcome.message);
+          setResultDialog({ variant: "warning", title: outcome.label, message: outcome.message });
           break;
         case "cancelled":
           toast.info("تم إلغاء العملية");
+          setResultDialog({ variant: "warning", title: outcome.label, message: outcome.message });
           break;
         case "timed_out":
           toast.error("انتهت مهلة العملية وأُنهيت");
+          setResultDialog({ variant: "failure", title: outcome.label, message: outcome.message });
           break;
         case "no_connection":
           toast.error("لا يوجد اتصال بالإنترنت");
+          setResultDialog({ variant: "failure", title: outcome.label, message: outcome.message });
           break;
         case "blocked_by_protection":
           toast.error(outcome.message);
           setProtectionBlocked(true);
+          setResultDialog({ variant: "failure", title: outcome.label, message: outcome.message });
           break;
         case "pin_refresh_required":
           toast.warning(outcome.message);
+          setLastAction({ action, buttonKey });
           setPinAdoption({
             from: outcome.pin_from || "؟",
             to: outcome.pin_to || "؟",
@@ -128,6 +142,7 @@ export default function Home() {
           break;
         default:
           toast.error(outcome.message);
+          setResultDialog({ variant: "failure", title: outcome.label, message: outcome.message });
           break;
       }
     } catch (error) {
@@ -191,21 +206,43 @@ export default function Home() {
   const handleAdoptPin = async () => {
     if (!pinAdoption) return;
     setAdopting(true);
+    let adopted = false;
     try {
       const message = await invoke<string>("adopt_mas_pin");
       addLog(`🔒 ${message}`);
       toast.success(message);
+      adopted = true;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       addLog(`❌ ${msg}`);
-      toast.error(msg);
+      toast.error(`تعذر إتمام العملية: ${msg}`);
     } finally {
       setAdopting(false);
       setPinAdoption(null);
     }
+    if (!adopted) {
+      setLastAction(null);
+      return;
+    }
+    if (lastAction) {
+      const { action, buttonKey } = lastAction;
+      if (busy) {
+        toast.info("التطبيق مشغول بعملية أخرى — يُرجى إعادة محاولة التفعيل يدويًا من الأزرار.");
+        setLastAction(null);
+        return;
+      }
+      setLastAction(null);
+      try {
+        await handleActivation(action, buttonKey, true);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        addLog(`❌ ${msg}`);
+        toast.error(`تعذر استئناف التفعيل بعد الاعتماد: ${msg}`);
+      }
+    }
   };
 
-  const handleCheckStatus = async () => {
+  const handleCheckStatus = async (logFocus: "windows" | "office" | null = null) => {
     if (busy) return;
     setStatusDialog(true);
     setStatusLoading(true);
@@ -225,10 +262,11 @@ export default function Home() {
       setStatus({ windows: winStatus, office: officeStatus });
 
       addLog(`✅ اكتمل الفحص${report.checked_at ? ` — ${report.checked_at}` : ""}`);
-      addLog(`💻 ويندوز: ${report.windows ? `${report.windows.name} — ${report.windows.label} (${report.windows.selection_reason})` : "غير مثبت"}`);
-      addLog(`📄 أوفيس: ${report.office ? `${report.office.name} — ${report.office.label} (${report.office.selection_reason})` : "غير مثبت"}`);
-      for (const p of report.observed.slice(0, 5)) {
-        addLog(`   • ${p.name} — ${p.label}`);
+      if (logFocus !== "office") {
+        addLog(`💻 ويندوز: ${report.windows ? `${report.windows.name} — ${report.windows.label}` : "غير مثبت"}`);
+      }
+      if (logFocus !== "windows") {
+        addLog(`📄 أوفيس: ${report.office ? `${report.office.name} — ${report.office.label}` : "غير مثبت"}`);
       }
 
       if (report.error) {
@@ -431,7 +469,7 @@ export default function Home() {
             whileTap={cardTap}
           >
             <Button
-              onClick={handleCheckStatus}
+              onClick={() => handleCheckStatus()}
               disabled={busy}
               className={`w-full h-32 rounded-xl text-lg font-bold flex flex-col items-center justify-center gap-3 transition-all duration-300 shadow-lg ${cardStyles.status} text-white relative overflow-hidden`}
             >
@@ -445,24 +483,6 @@ export default function Home() {
             </Button>
           </motion.div>
         </motion.div>
-
-        {/* Cancel button while running */}
-        {busy && (
-          <motion.div className="mb-8" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
-            <Button
-              onClick={handleCancel}
-              disabled={opState === "cancelling"}
-              className="rounded-lg px-6 py-3 font-semibold bg-red-600/80 hover:bg-red-700 text-white border border-red-400/30 disabled:opacity-50"
-            >
-              {opState === "cancelling" ? (
-                <Loader2 className="w-4 h-4 animate-spin ml-2" />
-              ) : (
-                <Ban className="w-4 h-4 ml-2" />
-              )}
-              {opState === "cancelling" ? "جاري الإلغاء..." : "إلغاء العملية"}
-            </Button>
-          </motion.div>
-        )}
 
         {/* Protection blocked banner (يظهر فقط عند الحجب) */}
         {protectionBlocked && !busy && (
@@ -626,7 +646,7 @@ export default function Home() {
         title={pendingAction ? `تأكيد ${pendingAction.action.label}` : "تأكيد العملية"}
         description={
           pendingAction
-            ? `سيتم تنفيذ «${pendingAction.action.label}» على نظامك — يُنزَّل سكربت التفعيل من المصدر الرسمي massgrave.dev ويُنفَّذ بصلاحيات المسؤول. قد تستغرق العملية عدة دقائق. هل تريد المتابعة؟`
+            ? `سيتم تنفيذ «${pendingAction.action.label}» على نظامك — سيُنفَّذ بصلاحيات المسؤول. قد تستغرق العملية عدة دقائق. تابع التنفيذ؟`
             : ""
         }
         confirmLabel="متابعة التنفيذ"
@@ -638,7 +658,13 @@ export default function Home() {
       {/* Pin adoption dialog (4.1 self-healing) */}
       <ConfirmDialog
         open={pinAdoption !== null}
-        onOpenChange={(v) => !adopting && setPinAdoption(v ? pinAdoption : null)}
+        onOpenChange={(v) => {
+          if (adopting) return;
+          if (!v) {
+            setPinAdoption(null);
+            setLastAction(null);
+          }
+        }}
         title="اعتماد إصدار جديد من سكربت التفعيل"
         description={
           pinAdoption
@@ -650,6 +676,107 @@ export default function Home() {
         onConfirm={handleAdoptPin}
         isDark={isDark}
       />
+
+      {/* Result dialog (نتيجة العملية — دائمة حتى يغلقها المستخدم: لا نجاح صامت) */}
+      <Dialog open={resultDialog !== null} onOpenChange={(v) => !v && setResultDialog(null)}>
+        <DialogContent
+          className={`rounded-xl max-w-md ${
+            resultDialog?.variant === "success"
+              ? isDark
+                ? "bg-gradient-to-br from-green-950 to-slate-900 border border-green-500/40"
+                : "bg-white border border-green-300"
+              : resultDialog?.variant === "warning"
+                ? isDark
+                  ? "bg-gradient-to-br from-amber-950 to-slate-900 border border-amber-500/40"
+                  : "bg-white border border-amber-300"
+                : isDark
+                  ? "bg-gradient-to-br from-red-950 to-slate-900 border border-red-500/40"
+                  : "bg-white border border-red-300"
+          }`}
+        >
+          <DialogHeader>
+            <DialogTitle
+              className={`text-xl flex items-center justify-center gap-2 ${
+                resultDialog?.variant === "success"
+                  ? isDark
+                    ? "text-green-300"
+                    : "text-green-700"
+                  : resultDialog?.variant === "warning"
+                    ? isDark
+                      ? "text-amber-300"
+                      : "text-amber-700"
+                    : isDark
+                      ? "text-red-300"
+                      : "text-red-700"
+              }`}
+            >
+              {resultDialog?.variant === "success" ? (
+                <CheckCircle2 className="w-6 h-6 shrink-0" />
+              ) : resultDialog?.variant === "warning" ? (
+                <ShieldAlert className="w-6 h-6 shrink-0" />
+              ) : (
+                <X className="w-6 h-6 shrink-0" />
+              )}
+              {resultDialog?.title}
+            </DialogTitle>
+            <DialogDescription className={`text-center text-sm ${isDark ? "text-cyan-100/80" : "text-slate-600"}`}>
+              {resultDialog?.message}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-center pt-2">
+            <Button
+              onClick={() => setResultDialog(null)}
+              className={`px-10 text-white ${
+                resultDialog?.variant === "success"
+                  ? "bg-green-600 hover:bg-green-700"
+                  : resultDialog?.variant === "warning"
+                    ? "bg-amber-600 hover:bg-amber-700"
+                    : "bg-red-600 hover:bg-red-700"
+              }`}
+            >
+              تم
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Busy operation dialog (نافذة التحميل أثناء العمليات الطويلة — لا يُغلق إلا بانتهاء العملية) */}
+      <Dialog open={busy} onOpenChange={() => {}}>
+        <DialogContent
+          className={`rounded-xl max-w-md ${isDark ? "bg-gradient-to-br from-slate-900 to-slate-800 border border-cyan-500/30" : "bg-white border border-slate-200"}`}
+          showCloseButton={false}
+          onPointerDownOutside={(e) => e.preventDefault()}
+          onEscapeKeyDown={(e) => e.preventDefault()}
+        >
+          <DialogHeader>
+            <DialogTitle className={`text-xl flex items-center gap-2 ${isDark ? "text-cyan-300" : "text-[#1E293B]"}`}>
+              <Loader2 className="w-5 h-5 animate-spin" />
+              {activeAction ? `جاري ${activeAction}...` : "جاري تنفيذ العملية..."}
+            </DialogTitle>
+            <DialogDescription className={isDark ? "text-cyan-200/70" : "text-slate-500"}>
+              {opState === "cancelling"
+                ? "جاري إيقاف العملية بأمان — لحظات..."
+                : "قد تستغرق العملية لحظات ..."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col items-center gap-4 py-3">
+            <Loader2 className={`w-14 h-14 animate-spin ${isDark ? "text-cyan-400" : "text-[#4682B4]"}`} />
+            <Button
+              onClick={handleCancel}
+              disabled={opState === "cancelling"}
+              variant="outline"
+              className={`flex items-center gap-2 ${isDark ? "bg-slate-700 hover:bg-slate-600 text-slate-200 border-slate-500/30" : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"}`}
+            >
+              {opState === "cancelling" ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Ban className="w-4 h-4" />
+              )}
+              {opState === "cancelling" ? "جاري الإلغاء..." : "إلغاء العملية"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Confetti celebration overlay */}
       {confettiOrigin && celebratingKey && (

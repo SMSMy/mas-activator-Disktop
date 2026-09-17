@@ -173,7 +173,7 @@ export function UpdateDialog({ info, open, onOpenChange, isDark }: UpdateDialogP
               جاري التحميل...
             </Button>
           ) : (
-            <Button onClick={handleClose} className={`flex-1 text-white ${isDark ? "bg-green-600 hover:bg-green-700" : "bg-green-600 hover:bg-green-700"}`}>
+            <Button onClick={handleClose} className="flex-1 text-white bg-green-600 hover:bg-green-700">
               <FolderOpen className="w-4 h-4 ml-2" />
               تم — إغلاق
             </Button>
